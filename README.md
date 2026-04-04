@@ -40,9 +40,18 @@ L'unica eccezione è il token Google OAuth (vedi sotto), che richiede un browser
 
 ### Passo 1 — Sul VPS: clona il repo
 
+Connettiti al VPS via SSH dal tuo PC, poi clona il repo in una cartella qualunque.
+**Tutti i comandi successivi vanno eseguiti da quella cartella** — Docker cerca
+`docker-compose.yml` nella directory corrente e copia i file dentro l'immagine al build.
+
 ```bash
-git clone <repo-url> /opt/python-utils
-cd /opt/python-utils
+# Dal tuo PC → connettiti al VPS
+ssh user@ip-vps
+
+# Ora sei sul VPS. Clona il repo (la cartella può essere qualunque).
+cd /opt
+git clone <repo-url> python-utils
+cd python-utils    # ← resta sempre qui per i comandi docker
 ```
 
 ### Passo 2 — Sul VPS: crea il file .env
@@ -115,11 +124,13 @@ curl http://localhost:8000/health   # → {"status":"ok"}
 
 ## Aggiornare il codice
 
-Quando aggiungi nuovi script al repo:
+`git pull` aggiorna i file sul VPS, `--build` li ricopia dentro il container.
 
 ```bash
-# Sul VPS
-cd /opt/python-utils
+# Dal tuo PC → connettiti al VPS
+ssh user@ip-vps
+
+cd /opt/python-utils        # ← cartella dove hai clonato il repo
 git pull
 docker compose up -d --build python-utils   # rebuild solo del container Python
 ```
