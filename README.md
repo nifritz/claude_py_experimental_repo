@@ -116,12 +116,62 @@ curl http://localhost:8000/health    # → {"status":"ok"}
 
 ## Aggiornare il codice
 
+### Manuale
+
 ```bash
 cd /opt/docker/python-utils
 git pull
 cd ..
 docker compose up -d --build python-utils
 ```
+
+### Automatico via webhook (push → deploy)
+
+Ogni volta che fai `git push`, il VPS si aggiorna da solo.
+
+**Aggiungi il servizio webhook al tuo docker-compose.yml:**
+
+```yaml
+  webhook:
+    build: ./python-utils/docker/webhook
+    container_name: webhook
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./python-utils:/repo          # repo da aggiornare con git pull
+      - .:/compose                    # cartella con docker-compose.yml
+    environment:
+      DEPLOY_SECRET: ${DEPLOY_SECRET}
+      REPO_PATH: /repo
+      COMPOSE_PATH: /compose
+      COMPOSE_SERVICES: python-utils
+    networks:
+      - <nome-rete-esistente>
+```
+
+Aggiungi nel tuo `.env`:
+
+```env
+DEPLOY_SECRET=scegli_una_stringa_segreta_lunga
+```
+
+Avvia il container:
+
+```bash
+docker compose up -d --build webhook
+```
+
+**Configura il webhook su Gitea/GitHub:**
+
+1. Vai nelle impostazioni del repo → **Webhooks** → Aggiungi webhook
+2. URL: `http://ip-vps:9000/deploy`
+3. Secret: il valore di `DEPLOY_SECRET`
+4. Content type: `application/json`
+5. Evento: solo **Push**
+
+Da quel momento ogni `git push` triggera automaticamente `git pull` + rebuild sul VPS.
 
 ---
 
