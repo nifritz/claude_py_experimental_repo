@@ -58,6 +58,8 @@ services:
       - ${WORKSPACE_PATH:-./workspace}:/workspace
       # Config Claude Code e MCP (persistente)
       - claude-config:/root/.claude
+      # Config MCP: montata direttamente, nessun comando manuale necessario
+      - ./docker/claude-code/.mcp.json.example:/root/.claude/mcp.json:ro
     networks:
       - vps-net
     depends_on:
