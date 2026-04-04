@@ -1,24 +1,131 @@
 version: "3.9"
 
+# =============================================================================
+# Stack completo VPS
+# =============================================================================
+# Servizi:
+#   python-utils  → script Python (API HTTP per N8N + MCP stdio per Claude Code)
+#   claude-code   → Claude Code CLI (accede a python-utils via docker exec MCP)
+#   n8n           → orchestratore workflow (chiama python-utils via HTTP POST)
+#   mariadb       → database per N8N
+#
+# Rete condivisa: vps-net  (tutti i container si vedono per nome)
+# =============================================================================
+
 services:
+
+  # ---------------------------------------------------------------------------
+  # Python utilities — API HTTP (porta 8000) + MCP server (stdio)
+  # ---------------------------------------------------------------------------
   python-utils:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: python-utils
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "8000:8000"           # esposto solo per debug; internamente usa vps-net
     volumes:
-      # Monta le credenziali Google dall'host (NON committare questi file)
-      - ./credentials.json:/app/credentials.json:ro
-      - ./token.json:/app/token.json
+      - ./credentials.json:/app/credentials.json:ro   # OAuth2 client secret
+      - ./token.json:/app/token.json                  # token OAuth2 (rw per refresh)
     environment:
       GDRIVE_CREDENTIALS_FILE: /app/credentials.json
       GDRIVE_TOKEN_FILE: /app/token.json
     networks:
-      - utils-net
+      - vps-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
+  # ---------------------------------------------------------------------------
+  # Claude Code CLI
+  # ---------------------------------------------------------------------------
+  claude-code:
+    build:
+      context: ./docker/claude-code
+      dockerfile: Dockerfile
+    container_name: claude-code
+    restart: unless-stopped
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}   # definito in .env
+    volumes:
+      # Socket Docker → permette a Claude Code di fare "docker exec" su python-utils (MCP)
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Workspace: cartella del progetto sull'host
+      - ${WORKSPACE_PATH:-./workspace}:/workspace
+      # Config Claude Code e MCP (persistente)
+      - claude-config:/root/.claude
+    networks:
+      - vps-net
+    depends_on:
+      - python-utils
+    # Interattivo: docker exec -it claude-code claude
+    stdin_open: true
+    tty: true
+
+  # ---------------------------------------------------------------------------
+  # N8N — orchestratore workflow
+  # ---------------------------------------------------------------------------
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      DB_TYPE: mariadb
+      DB_MYSQLDB_HOST: mariadb
+      DB_MYSQLDB_PORT: 3306
+      DB_MYSQLDB_DATABASE: ${MYSQL_DATABASE:-n8n}
+      DB_MYSQLDB_USER: ${MYSQL_USER:-n8n}
+      DB_MYSQLDB_PASSWORD: ${MYSQL_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:5678}
+    volumes:
+      - n8n-data:/home/node/.n8n
+    networks:
+      - vps-net
+    depends_on:
+      mariadb:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # MariaDB — database per N8N
+  # ---------------------------------------------------------------------------
+  mariadb:
+    image: mariadb:11
+    container_name: mariadb
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-n8n}
+      MYSQL_USER: ${MYSQL_USER:-n8n}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    networks:
+      - vps-net
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+# =============================================================================
+# Volumi persistenti
+# =============================================================================
+volumes:
+  n8n-data:
+  mariadb-data:
+  claude-config:    # config e history Claude Code
+
+# =============================================================================
+# Rete interna condivisa
+# =============================================================================
 networks:
-  utils-net:
-    # Aggiungi qui la rete condivisa con N8N se necessario, es:
-    # external: true
-    # name: n8n_default
+  vps-net:
+    driver: bridge
