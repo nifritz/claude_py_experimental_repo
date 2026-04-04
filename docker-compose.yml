@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  python-utils:
+    build: .
+    container_name: python-utils
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Monta le credenziali Google dall'host (NON committare questi file)
+      - ./credentials.json:/app/credentials.json:ro
+      - ./token.json:/app/token.json
+    environment:
+      GDRIVE_CREDENTIALS_FILE: /app/credentials.json
+      GDRIVE_TOKEN_FILE: /app/token.json
+    networks:
+      - utils-net
+
+networks:
+  utils-net:
+    # Aggiungi qui la rete condivisa con N8N se necessario, es:
+    # external: true
+    # name: n8n_default
