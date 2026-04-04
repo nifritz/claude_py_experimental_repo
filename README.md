@@ -1,138 +1,126 @@
 # claude_py_experimental_repo
 
-Script Python invocabili da **N8N** (HTTP POST) e **Claude Code** (MCP),
-eseguiti in un container Docker sul VPS.
+Script Python invocabili da **N8N** (HTTP POST) e **Claude Code** (MCP).
 
 ---
 
 ## Architettura
 
 ```
-Il tuo PC  ──SSH──►  VPS Hostinger
-                          │
-                     docker compose
-                          │
-              ┌───────────┼───────────────┐
-              │           │               │
-           mariadb       n8n        claude-code
-              │           │               │
-              └───────────┘        docker exec -i
-                                         │ (MCP stdio)
-                                         ▼
-                                   python-utils :8000
-                                   ├── api_server.py   ◄── n8n HTTP POST
-                                   ├── mcp_server.py   ◄── claude-code MCP
-                                   └── scripts/        (condivisi)
+VPS
+└── /opt/docker/                    ← cartella dove hai già il tuo stack
+    ├── docker-compose.yml          ← il TUO file, aggiungi i due servizi
+    ├── .env
+    └── python-utils/               ← repo clonato qui come sottocartella
+        ├── scripts/
+        ├── mcp_server.py
+        ├── api_server.py
+        └── Dockerfile
 ```
 
----
-
-## Come si lavora
-
-**Tutto avviene sul VPS via SSH.** Dal tuo PC apri un terminale e fai SSH sul VPS.
-Da lì, un solo comando avvia tutto: `docker compose up -d`.
-
-L'unica eccezione è il token Google OAuth (vedi sotto), che richiede un browser una volta sola.
+I container python-utils e claude-code vengono aggiunti al tuo stack esistente.
+Condividono la stessa rete Docker di n8n e si vedono per nome.
 
 ---
 
 ## Installazione
 
-### Passo 1 — Sul VPS: clona il repo
-
-Connettiti al VPS via SSH dal tuo PC, poi clona il repo in una cartella qualunque.
-**Tutti i comandi successivi vanno eseguiti da quella cartella** — Docker cerca
-`docker-compose.yml` nella directory corrente e copia i file dentro l'immagine al build.
+### 1. Vai nella cartella dove hai già il tuo docker-compose.yml
 
 ```bash
-# Dal tuo PC → connettiti al VPS
 ssh user@ip-vps
-
-# Ora sei sul VPS. Clona il repo (la cartella può essere qualunque).
-cd /opt
-git clone <repo-url> python-utils
-cd python-utils    # ← resta sempre qui per i comandi docker
+cd /opt/docker          # ← adatta al tuo percorso reale
 ```
 
-### Passo 2 — Sul VPS: crea il file .env
+### 2. Clona il repo come sottocartella
 
 ```bash
-cp .env.example .env
-nano .env
+git clone <repo-url> python-utils
 ```
 
-Compila questi valori:
+### 3. Copia le credenziali Google dentro la sottocartella
+
+```bash
+# Dal tuo PC (non dal VPS)
+scp credentials.json token.json user@ip-vps:/opt/docker/python-utils/
+```
+
+> Se non hai ancora `token.json` vedi la sezione "Token Google OAuth2" in fondo.
+
+### 4. Aggiungi i due servizi al tuo docker-compose.yml esistente
+
+Apri `/opt/docker/docker-compose.yml` e aggiungi dentro `services:`:
+
+```yaml
+  python-utils:
+    build: ./python-utils
+    container_name: python-utils
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./python-utils/credentials.json:/app/credentials.json:ro
+      - ./python-utils/token.json:/app/token.json
+    environment:
+      GDRIVE_CREDENTIALS_FILE: /app/credentials.json
+      GDRIVE_TOKEN_FILE: /app/token.json
+    networks:
+      - <nome-rete-esistente>      # stesso nome della rete di n8n
+
+  claude-code:
+    build: ./python-utils/docker/claude-code
+    container_name: claude-code
+    restart: unless-stopped
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./python-utils:/workspace
+      - claude-config:/root/.claude
+      - ./python-utils/docker/claude-code/.mcp.json.example:/root/.claude/mcp.json:ro
+    networks:
+      - <nome-rete-esistente>
+    depends_on:
+      - python-utils
+    stdin_open: true
+    tty: true
+```
+
+Aggiungi `claude-config` nella sezione `volumes:` del tuo compose:
+
+```yaml
+volumes:
+  claude-config:
+```
+
+Aggiungi `ANTHROPIC_API_KEY` nel tuo `.env`:
 
 ```env
-ANTHROPIC_API_KEY=sk-ant-...          # API key Anthropic
-WORKSPACE_PATH=/opt/python-utils      # cartella del progetto sul VPS
-
-MYSQL_ROOT_PASSWORD=scegli_password
-MYSQL_PASSWORD=scegli_password
-N8N_ENCRYPTION_KEY=stringa_random_32_caratteri
-N8N_WEBHOOK_URL=https://tuodominio.com:5678
+ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-### Passo 3 — Google OAuth2: genera il token (una volta sola)
-
-Questo passaggio richiede un browser ed è l'unico che **non** puoi fare
-direttamente sul VPS. Hai due opzioni:
-
-**Opzione A — Dal tuo PC in locale** (consigliata):
+### 5. Avvia i nuovi container
 
 ```bash
-# Sul tuo PC (non sul VPS)
-pip install google-auth-oauthlib google-api-python-client pypdf
-python scripts/gdrive_folder_to_pdf.py \
-  --src "URL_CARTELLA_SORGENTE" \
-  --dst "URL_CARTELLA_DESTINAZIONE"
-# Si apre il browser → autorizza → viene creato token.json
-
-# Poi copia entrambi i file sul VPS
-scp credentials.json token.json user@ip-vps:/opt/python-utils/
+docker compose up -d --build python-utils claude-code
 ```
 
-**Opzione B — Con port forwarding SSH** (tutto sul VPS):
+### 6. Verifica
 
 ```bash
-# Dal tuo PC, apri un tunnel SSH
-ssh -L 8085:localhost:8085 user@ip-vps
-
-# Poi sul VPS esegui lo script: il browser si aprirà sul tuo PC
-python scripts/gdrive_folder_to_pdf.py --src "..." --dst "..."
-```
-
-> Dopo questa operazione `credentials.json` e `token.json` rimangono sul VPS
-> e non servono più interventi manuali. Il token si rinnova da solo.
-
-### Passo 4 — Sul VPS: avvia tutto
-
-```bash
-docker compose up -d
-```
-
-Fine. I container si avviano nell'ordine corretto grazie ai `depends_on`.
-
-### Passo 5 — Verifica
-
-```bash
-docker compose ps          # tutti i container devono essere "running"
-curl http://localhost:8000/health   # → {"status":"ok"}
+docker compose ps
+curl http://localhost:8000/health    # → {"status":"ok"}
 ```
 
 ---
 
 ## Aggiornare il codice
 
-`git pull` aggiorna i file sul VPS, `--build` li ricopia dentro il container.
-
 ```bash
-# Dal tuo PC → connettiti al VPS
-ssh user@ip-vps
-
-cd /opt/python-utils        # ← cartella dove hai clonato il repo
+cd /opt/docker/python-utils
 git pull
-docker compose up -d --build python-utils   # rebuild solo del container Python
+cd ..
+docker compose up -d --build python-utils
 ```
 
 ---
@@ -140,38 +128,31 @@ docker compose up -d --build python-utils   # rebuild solo del container Python
 ## Usare Claude Code
 
 ```bash
-# Apri una sessione interattiva (dal VPS via SSH)
 docker exec -it claude-code claude
 ```
 
-Claude Code si avvia con i tool MCP già configurati e pronti.
+I tool MCP sono già configurati e pronti.
 
 ---
 
-## Scripts disponibili
-
-| Script | Endpoint HTTP | Tool MCP | Descrizione |
-|---|---|---|---|
-| `scripts/gdrive_folder_to_pdf.py` | `POST /gdrive-to-pdf` | `gdrive_folder_to_pdf` | Converte cartella Drive → PDF |
-
----
-
-## API HTTP (per N8N)
-
-Documentazione interattiva Swagger: `http://ip-vps:8000/docs`
+## API HTTP per N8N
 
 ### `POST /gdrive-to-pdf`
 
-**Request:**
-```json
+Nel nodo **HTTP Request** di N8N:
+
+```
+Method:  POST
+URL:     http://python-utils:8000/gdrive-to-pdf
+Body:
 {
-  "src": "https://drive.google.com/drive/folders/SOURCE_ID",
-  "dst": "https://drive.google.com/drive/folders/DEST_ID",
+  "src":    "https://drive.google.com/drive/folders/SOURCE_ID",
+  "dst":    "https://drive.google.com/drive/folders/DEST_ID",
   "output": "report.pdf"
 }
 ```
 
-**Response:**
+Risposta:
 ```json
 {
   "id": "1xYz...",
@@ -180,19 +161,11 @@ Documentazione interattiva Swagger: `http://ip-vps:8000/docs`
 }
 ```
 
-### Nodo N8N — HTTP Request
-
-```
-Method:  POST
-URL:     http://python-utils:8000/gdrive-to-pdf
-Body:    { "src": "...", "dst": "...", "output": "..." }
-```
-
-N8N e python-utils sono sulla stessa rete Docker (`vps-net`) e si vedono per nome.
+Swagger UI: `http://ip-vps:8000/docs`
 
 ---
 
-## Tool MCP (per Claude Code)
+## Tool MCP per Claude Code
 
 ### `gdrive_folder_to_pdf`
 
@@ -204,33 +177,37 @@ N8N e python-utils sono sulla stessa rete Docker (`vps-net`) e si vedono per nom
 
 ---
 
+## Token Google OAuth2 (solo prima volta)
+
+Il token richiede un browser. Farlo dal tuo PC:
+
+```bash
+# Sul tuo PC
+pip install google-auth-oauthlib google-api-python-client pypdf
+python python-utils/scripts/gdrive_folder_to_pdf.py \
+  --src "URL_SORGENTE" --dst "URL_DESTINAZIONE"
+# Si apre il browser → autorizza → viene creato token.json
+
+# Copia sul VPS
+scp credentials.json token.json user@ip-vps:/opt/docker/python-utils/
+```
+
+Da quel momento il token si rinnova automaticamente.
+
+---
+
+## Scripts disponibili
+
+| Script | Endpoint | Tool MCP | Descrizione |
+|---|---|---|---|
+| `scripts/gdrive_folder_to_pdf.py` | `POST /gdrive-to-pdf` | `gdrive_folder_to_pdf` | Cartella Drive → PDF unico |
+
+---
+
 ## Aggiungere nuovi script
 
 1. Crea `scripts/nuovo_script.py` con funzione `run(...)`
 2. Registra il tool in `mcp_server.py`
 3. Aggiungi l'endpoint in `api_server.py`
-4. Aggiorna la tabella "Scripts disponibili" qui sopra
+4. Aggiorna la tabella qui sopra
 5. `git push` → sul VPS `git pull && docker compose up -d --build python-utils`
-
----
-
-## Struttura del progetto
-
-```
-claude_py_experimental_repo/
-├── scripts/
-│   ├── __init__.py
-│   └── gdrive_folder_to_pdf.py
-├── tests/
-│   └── test_gdrive_folder_to_pdf.py
-├── docker/
-│   └── claude-code/
-│       ├── Dockerfile
-│       └── .mcp.json.example
-├── mcp_server.py
-├── api_server.py
-├── Dockerfile
-├── docker-compose.yml
-├── pyproject.toml
-└── .env.example
-```
