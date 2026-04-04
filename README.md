@@ -23,6 +23,61 @@ Condividono la stessa rete Docker di n8n e si vedono per nome.
 
 ---
 
+## Come funziona Docker (basi utili per capire il resto)
+
+Se sei nuovo a Docker, questi tre concetti ti evitano confusione.
+
+### 1. `build: ./python-utils` non è un puntamento — è una costruzione
+
+Quando esegui `docker compose up --build`, Docker legge il `Dockerfile` nella
+cartella indicata e **costruisce un'immagine**: scarica Python, installa le
+librerie con pip, copia il codice dentro. Il risultato è un'immagine autonoma
+salvata localmente sul VPS.
+
+```
+Dockerfile  →  docker build  →  Immagine locale  →  Container in esecuzione
+(istruzioni)    (una tantum)     (salvata sul VPS)    (istanza dell'immagine)
+```
+
+Dopo il build il container non dipende più dalla cartella del repo: ha tutto
+al suo interno.
+
+### 2. Python non viene riscaricato ad ogni riavvio
+
+L'immagine viene costruita **una sola volta** (o quando aggiorni il codice con
+`--build`). Riavvii, reboot del VPS, `docker compose restart` usano sempre
+l'immagine già salvata — nessun download.
+
+Docker usa una cache a layer: se `FROM python:3.11-slim` non cambia tra un
+build e l'altro, quel layer viene riusato. Solo i layer modificati vengono
+ricostruiti.
+
+```
+Primo avvio (--build):
+  scarica python:3.11-slim + installa pip + copia codice → salva immagine → avvia
+
+Riavvii successivi:
+  usa immagine già salvata → avvia   (veloce, nessun download)
+
+Dopo un git pull (--build):
+  layer Python in cache → reinstalla solo le dipendenze cambiate → copia nuovo codice → avvia
+```
+
+### 3. Volumi = i soli file che restano fuori dal container
+
+Il codice è dentro l'immagine. I soli file montati dall'esterno (volumi) sono
+quelli che contengono segreti o dati che cambiano a runtime:
+
+```yaml
+volumes:
+  - ./python-utils/credentials.json:/app/credentials.json:ro   # credenziali Google
+  - ./python-utils/token.json:/app/token.json                   # token OAuth (si rinnova)
+```
+
+Tutto il resto — Python, librerie, script — è dentro il container.
+
+---
+
 ## Installazione
 
 ### 1. Vai nella cartella dove hai già il tuo docker-compose.yml
