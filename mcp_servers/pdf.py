@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-mcp_server.py
+MCP server — PDF
 
-MCP (Model Context Protocol) server that exposes Python utility scripts
-as tools callable by Claude Code.
+Tool per la manipolazione di file PDF.
+Ogni script in scripts/ che lavora con PDF va esposto qui.
 
-Transport: stdio (standard MCP transport for subprocess invocation)
-
-Usage:
-    python mcp_server.py
+Avvio (gestito da Claude Code tramite .mcp.json):
+    python mcp_servers/pdf.py
 """
 
 import asyncio
@@ -23,7 +21,7 @@ from scripts.merge_pdfs import merge
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-server = Server("python-utils")
+server = Server("pdf")
 
 
 @server.list_tools()
@@ -33,7 +31,7 @@ async def list_tools() -> list[types.Tool]:
             name="merge_pdfs",
             description=(
                 "Unisce più file PDF in un unico PDF. "
-                "Accetta una lista di percorsi file all'interno del workspace "
+                "Accetta una lista di percorsi file nel workspace "
                 "e salva il risultato nel percorso indicato."
             ),
             inputSchema={
@@ -42,16 +40,20 @@ async def list_tools() -> list[types.Tool]:
                     "files": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Lista di percorsi dei file PDF da unire (in ordine)",
+                        "description": "Percorsi dei PDF da unire (in ordine)",
                     },
                     "output": {
                         "type": "string",
-                        "description": "Percorso del file PDF di output",
+                        "description": "Percorso del PDF di output",
                     },
                 },
                 "required": ["files", "output"],
             },
         ),
+        # Aggiungi qui altri tool PDF:
+        # - split_pdf
+        # - compress_pdf
+        # - extract_pages
     ]
 
 
@@ -61,33 +63,21 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         file_paths: list[str] = arguments["files"]
         output_path: str = arguments["output"]
 
-        pdf_bytes_list: list[bytes] = []
-        for path in file_paths:
-            p = Path(path)
-            if not p.exists():
-                raise FileNotFoundError(f"File non trovato: {path!r}")
-            pdf_bytes_list.append(p.read_bytes())
-
+        pdf_bytes_list = [Path(p).read_bytes() for p in file_paths]
         merged = merge(pdf_bytes_list)
         Path(output_path).write_bytes(merged)
 
-        return [
-            types.TextContent(
-                type="text",
-                text=f"PDF uniti con successo ({len(file_paths)} file).\nSalvato in: {output_path}",
-            )
-        ]
+        return [types.TextContent(
+            type="text",
+            text=f"PDF uniti ({len(file_paths)} file) → {output_path}",
+        )]
 
     raise ValueError(f"Tool sconosciuto: {name!r}")
 
 
 async def main() -> None:
     async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options(),
-        )
+        await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
 if __name__ == "__main__":

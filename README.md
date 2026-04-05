@@ -173,12 +173,50 @@ Query param opzionale: `?output=nome.pdf` (nome nel header Content-Disposition).
 docker exec -it claude-code claude
 ```
 
-### Tool: `merge_pdfs`
+### Filosofia: un server MCP per dominio
 
-| Parametro | Obbligatorio | Descrizione |
-|---|---|---|
-| `files` | si | Lista di percorsi file PDF nel workspace (in ordine) |
-| `output` | si | Percorso del PDF di output |
+Non esiste un unico server MCP con tutti gli script dentro.
+Ogni server copre un dominio coerente ed è un processo stdio separato.
+
+```
+mcp_servers/
+├── pdf.py      ← tutto ciò che riguarda PDF   (merge, split, compress…)
+├── images.py   ← tutto ciò che riguarda immagini (resize, convert…)
+└── data.py     ← tutto ciò che riguarda dati  (CSV, JSON, tabelle…)
+```
+
+Quando aggiungi uno script nuovo, la prima domanda è:
+**"In quale server va questo tool?"** — non "aggiungo al server esistente".
+
+Se nessuno è adatto, crei `mcp_servers/nuovo_dominio.py` e aggiungi
+l'entry in `.mcp.json`.
+
+```json
+// .mcp.json — ogni server è una entry separata
+{
+  "mcpServers": {
+    "pdf":    { "command": "docker", "args": ["exec", "-i", "python-utils", "python", "/app/mcp_servers/pdf.py"] },
+    "images": { "command": "docker", "args": ["exec", "-i", "python-utils", "python", "/app/mcp_servers/images.py"] },
+    "data":   { "command": "docker", "args": ["exec", "-i", "python-utils", "python", "/app/mcp_servers/data.py"] }
+  }
+}
+```
+
+### Server e tool disponibili
+
+#### `pdf` — `mcp_servers/pdf.py`
+
+| Tool | Descrizione |
+|---|---|
+| `merge_pdfs` | Unisce PDF locali in un unico file |
+
+#### `images` — `mcp_servers/images.py`
+
+Scheletro pronto. Aggiungi tool commentando/decommentando in `list_tools()`.
+
+#### `data` — `mcp_servers/data.py`
+
+Scheletro pronto. Aggiungi tool commentando/decommentando in `list_tools()`.
 
 ---
 
@@ -203,16 +241,22 @@ docker compose -f python-utils/docker-compose.yml up -d --build python-utils
 
 ## Aggiungere nuovi script
 
-1. Crea `scripts/nome_script.py` con la logica pura (nessuna I/O Google)
-2. Aggiungi l'endpoint in `api_server.py`
-3. Aggiungi il tool in `mcp_server.py`
-4. `git push` → deploy automatico
+### Checklist
 
-### Script disponibili
+1. **Crea** `scripts/nome_script.py` — logica pura, no I/O esterno, no auth
+2. **Scegli il server MCP** giusto per dominio (`mcp_servers/pdf.py`, `images.py`, `data.py`)
+   — se nessuno è adatto, crea `mcp_servers/nuovo.py` e aggiungilo a `.mcp.json`
+3. **Importa e registra** il tool in quel server (segui il pattern commentato negli scheletri)
+4. **Aggiungi l'endpoint** in `api_server.py` se lo script serve anche a N8N
+5. `git push` → deploy automatico
 
-| Script | Endpoint | Tool MCP | Descrizione |
+### Mappa script → server MCP → endpoint HTTP
+
+| Script | Server MCP | Endpoint HTTP | Descrizione |
 |---|---|---|---|
-| `scripts/merge_pdfs.py` | `POST /merge-pdfs` | `merge_pdfs` | Unisce PDF binari in input |
+| `scripts/merge_pdfs.py` | `mcp_servers/pdf.py` | `POST /merge-pdfs` | Unisce PDF |
+| *(scheletro)* | `mcp_servers/images.py` | — | Operazioni immagini |
+| *(scheletro)* | `mcp_servers/data.py` | — | Trasformazione dati |
 
 ---
 
@@ -220,18 +264,22 @@ docker compose -f python-utils/docker-compose.yml up -d --build python-utils
 
 ```
 python-utils/
-├── scripts/
+├── scripts/                    ← logica pura (no auth, no I/O esterno)
 │   ├── __init__.py
-│   └── merge_pdfs.py           ← logica pura (no auth)
+│   └── merge_pdfs.py
+├── mcp_servers/                ← un server per dominio
+│   ├── __init__.py
+│   ├── pdf.py                  ← tool PDF (merge_pdfs, …)
+│   ├── images.py               ← tool immagini (scheletro)
+│   └── data.py                 ← tool dati (scheletro)
 ├── docker/
 │   ├── claude-code/
 │   │   ├── Dockerfile
-│   │   └── .mcp.json.example
+│   │   └── .mcp.json.example   ← un entry per server MCP
 │   └── webhook/
 │       ├── Dockerfile
 │       └── server.py
 ├── api_server.py               ← HTTP server per N8N
-├── mcp_server.py               ← MCP server per Claude Code
 ├── Dockerfile
 ├── docker-compose.yml
 ├── pyproject.toml
