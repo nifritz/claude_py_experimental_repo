@@ -10,6 +10,7 @@ Variabili d'ambiente:
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 import subprocess
@@ -50,6 +51,11 @@ async def deploy(
 ) -> dict:
     body = await request.body()
     _verify_signature(body, x_hub_signature_256)
+
+    payload = json.loads(body)
+    if payload.get("ref") != "refs/heads/main":
+        log.info("Push su branch non-main, ignorato.")
+        return {"status": "ignored"}
 
     log.info("Deploy avviato...")
     try:
