@@ -1,21 +1,23 @@
 version: "3.9"
 
 # =============================================================================
-# Stack completo VPS
-# =============================================================================
-# Servizi:
-#   python-utils  → script Python (API HTTP per N8N + MCP stdio per Claude Code)
-#   claude-code   → Claude Code CLI (accede a python-utils via docker exec MCP)
-#   n8n           → orchestratore workflow (chiama python-utils via HTTP POST)
-#   mariadb       → database per N8N
+# Stack Python utilities — da aggiungere allo stack Docker esistente
 #
-# Rete condivisa: vps-net  (tutti i container si vedono per nome)
+# PRIMA DI AVVIARE:
+#   1. Crea il file .env (copia da .env.example e compila i valori)
+#   2. Copia credentials.json e token.json in questa cartella
+#
+# AVVIO:
+#   cd dockercomposepath/
+#   docker compose -f python-utils/docker-compose.yml up -d --build
 # =============================================================================
 
 services:
 
   # ---------------------------------------------------------------------------
-  # Python utilities — API HTTP (porta 8000) + MCP server (stdio)
+  # python-utils — API HTTP (N8N) + MCP server (Claude Code)
+  # Raggiungibile internamente come: http://python-utils:8000
+  # Nessuna porta esposta all'esterno.
   # ---------------------------------------------------------------------------
   python-utils:
     build:
@@ -23,25 +25,24 @@ services:
       dockerfile: Dockerfile
     container_name: python-utils
     restart: unless-stopped
-    ports:
-      - "8000:8000"           # esposto solo per debug; internamente usa vps-net
     volumes:
-      - ./credentials.json:/app/credentials.json:ro   # OAuth2 client secret
-      - ./token.json:/app/token.json                  # token OAuth2 (rw per refresh)
+      - ./credentials.json:/app/credentials.json:ro
+      - ./token.json:/app/token.json
     environment:
       GDRIVE_CREDENTIALS_FILE: /app/credentials.json
       GDRIVE_TOKEN_FILE: /app/token.json
     networks:
-      - vps-net
+      - existing-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 15s
 
   # ---------------------------------------------------------------------------
-  # Claude Code CLI
+  # claude-code — Claude Code CLI con accesso MCP a python-utils
+  # Uso: docker exec -it claude-code claude
   # ---------------------------------------------------------------------------
   claude-code:
     build:
@@ -50,84 +51,50 @@ services:
     container_name: claude-code
     restart: unless-stopped
     environment:
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}   # definito in .env
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
     volumes:
-      # Socket Docker → permette a Claude Code di fare "docker exec" su python-utils (MCP)
       - /var/run/docker.sock:/var/run/docker.sock
-      # Workspace: cartella del progetto sull'host
-      - ${WORKSPACE_PATH:-./workspace}:/workspace
-      # Config Claude Code e MCP (persistente)
+      - ./:/workspace
       - claude-config:/root/.claude
-      # Config MCP: montata direttamente, nessun comando manuale necessario
       - ./docker/claude-code/.mcp.json.example:/root/.claude/mcp.json:ro
     networks:
-      - vps-net
+      - existing-net
     depends_on:
-      - python-utils
-    # Interattivo: docker exec -it claude-code claude
+      python-utils:
+        condition: service_healthy
     stdin_open: true
     tty: true
 
   # ---------------------------------------------------------------------------
-  # N8N — orchestratore workflow
+  # webhook — deploy automatico al push su GitHub
+  # Porta 9000 esposta: GitHub chiama dall'esterno.
+  # NON viene mai rebuilt dallo script deploy (rimane sempre attivo).
   # ---------------------------------------------------------------------------
-  n8n:
-    image: n8nio/n8n:latest
-    container_name: n8n
+  webhook:
+    build:
+      context: ./docker/webhook
+      dockerfile: Dockerfile
+    container_name: webhook
     restart: unless-stopped
     ports:
-      - "5678:5678"
-    environment:
-      DB_TYPE: mariadb
-      DB_MYSQLDB_HOST: mariadb
-      DB_MYSQLDB_PORT: 3306
-      DB_MYSQLDB_DATABASE: ${MYSQL_DATABASE:-n8n}
-      DB_MYSQLDB_USER: ${MYSQL_USER:-n8n}
-      DB_MYSQLDB_PASSWORD: ${MYSQL_PASSWORD}
-      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
-      WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:5678}
+      - "9000:9000"
     volumes:
-      - n8n-data:/home/node/.n8n
-    networks:
-      - vps-net
-    depends_on:
-      mariadb:
-        condition: service_healthy
-
-  # ---------------------------------------------------------------------------
-  # MariaDB — database per N8N
-  # ---------------------------------------------------------------------------
-  mariadb:
-    image: mariadb:11
-    container_name: mariadb
-    restart: unless-stopped
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/repo
+      - ..:/compose
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-n8n}
-      MYSQL_USER: ${MYSQL_USER:-n8n}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-    volumes:
-      - mariadb-data:/var/lib/mysql
+      DEPLOY_SECRET: ${DEPLOY_SECRET}
+      REPO_PATH: /repo
+      COMPOSE_PATH: /compose
+      COMPOSE_FILE: python-utils/docker-compose.yml
+      COMPOSE_SERVICES: python-utils
     networks:
-      - vps-net
-    healthcheck:
-      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
+      - existing-net
 
-# =============================================================================
-# Volumi persistenti
-# =============================================================================
 volumes:
-  n8n-data:
-  mariadb-data:
-  claude-config:    # config e history Claude Code
+  claude-config:
 
-# =============================================================================
-# Rete interna condivisa
-# =============================================================================
 networks:
-  vps-net:
-    driver: bridge
+  existing-net:
+    external: true
+    name: ${DOCKER_NETWORK_NAME}

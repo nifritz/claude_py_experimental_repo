@@ -1,170 +1,179 @@
-# claude_py_experimental_repo
+# python-utils
 
-Script Python invocabili da **N8N** (HTTP POST) e **Claude Code** (MCP).
+Script Python eseguiti in un container Docker, invocabili da **N8N** (HTTP POST)
+e da **Claude Code** (MCP). Vive come sottocartella dello stack Docker esistente.
 
 ---
 
 ## Architettura
 
 ```
-VPS
-└── /opt/docker/                    ← cartella dove hai già il tuo stack
-    ├── docker-compose.yml          ← il TUO file, aggiungi i due servizi
-    ├── .env
-    └── python-utils/               ← repo clonato qui come sottocartella
-        ├── scripts/
-        ├── mcp_server.py
-        ├── api_server.py
-        └── Dockerfile
+dockercomposepath/
+├── docker-compose.yml        ← il TUO compose esistente (n8n, mariadb, ecc.)
+├── .env                      ← il TUO .env (aggiungi 3 variabili)
+└── python-utils/             ← questo repo (git clone)
+    ├── docker-compose.yml    ← compose dei 3 nuovi container
+    ├── credentials.json      ← copiato da te (una volta sola)
+    ├── token.json            ← generato una volta, poi aggiornato da N8N
+    ├── Dockerfile
+    ├── api_server.py
+    ├── mcp_server.py
+    └── scripts/
 ```
 
-I container python-utils e claude-code vengono aggiunti al tuo stack esistente.
-Condividono la stessa rete Docker di n8n e si vedono per nome.
+I 3 nuovi container si agganciano alla rete Docker già esistente (quella di n8n,
+mariadb, ecc.) e si vedono tra loro per nome servizio.
+
+```
+N8N  ──────── HTTP POST ──────►  python-utils:8000
+                                      │
+Claude Code  ─ docker exec -i ──►     │ (stessa immagine)
+                                      │
+GitHub  ────── POST :9000 ──────►  webhook:9000
+                                      │
+                                  git pull + docker compose up --build
+```
 
 ---
 
-## Come funziona Docker (basi utili per capire il resto)
+## Come funziona Docker (leggilo se sei nuovo)
 
-Se sei nuovo a Docker, questi tre concetti ti evitano confusione.
+### Il comando `build` costruisce una vera immagine
 
-### 1. `build: ./python-utils` non è un puntamento — è una costruzione
+`build: .` nel docker-compose non è un puntamento alla cartella. È un'istruzione:
+"costruisci un'immagine partendo dal Dockerfile in quella cartella".
 
-Quando esegui `docker compose up --build`, Docker legge il `Dockerfile` nella
-cartella indicata e **costruisce un'immagine**: scarica Python, installa le
-librerie con pip, copia il codice dentro. Il risultato è un'immagine autonoma
-salvata localmente sul VPS.
+Il Dockerfile fa:
+1. Scarica `python:3.11-slim` da Docker Hub → Python installato qui
+2. Esegue `pip install` → librerie installate dentro l'immagine
+3. Copia il codice dentro l'immagine
 
-```
-Dockerfile  →  docker build  →  Immagine locale  →  Container in esecuzione
-(istruzioni)    (una tantum)     (salvata sul VPS)    (istanza dell'immagine)
-```
+Il risultato è un'immagine autonoma salvata localmente sul VPS.
+Dopo il build, il container non dipende più dalla cartella del repo.
 
-Dopo il build il container non dipende più dalla cartella del repo: ha tutto
-al suo interno.
+### Python non viene riscaricato a ogni riavvio
 
-### 2. Python non viene riscaricato ad ogni riavvio
+L'immagine viene costruita una sola volta. Riavvii, reboot del VPS,
+`docker compose restart` riutilizzano sempre l'immagine già salvata.
+Nessun download.
 
-L'immagine viene costruita **una sola volta** (o quando aggiorni il codice con
-`--build`). Riavvii, reboot del VPS, `docker compose restart` usano sempre
-l'immagine già salvata — nessun download.
-
-Docker usa una cache a layer: se `FROM python:3.11-slim` non cambia tra un
-build e l'altro, quel layer viene riusato. Solo i layer modificati vengono
-ricostruiti.
+Docker usa una cache a layer: se `FROM python:3.11-slim` non cambia
+tra un build e l'altro, quel layer viene riusato automaticamente.
 
 ```
 Primo avvio (--build):
-  scarica python:3.11-slim + installa pip + copia codice → salva immagine → avvia
+  scarica Python + pip install + copia codice → salva immagine → avvia
 
 Riavvii successivi:
-  usa immagine già salvata → avvia   (veloce, nessun download)
+  usa immagine già salvata → avvia   ← veloce, nessun download
 
-Dopo un git pull (--build):
-  layer Python in cache → reinstalla solo le dipendenze cambiate → copia nuovo codice → avvia
+Dopo git pull (--build):
+  layer Python in cache → ricopia solo il codice → avvia
 ```
 
-### 3. Volumi = i soli file che restano fuori dal container
+### I volumi sono i soli file fuori dal container
 
-Il codice è dentro l'immagine. I soli file montati dall'esterno (volumi) sono
+Tutto il codice è dentro l'immagine. I soli file montati dall'esterno sono
 quelli che contengono segreti o dati che cambiano a runtime:
 
 ```yaml
 volumes:
-  - ./python-utils/credentials.json:/app/credentials.json:ro   # credenziali Google
-  - ./python-utils/token.json:/app/token.json                   # token OAuth (si rinnova)
+  - ./credentials.json:/app/credentials.json:ro   # client secret Google
+  - ./token.json:/app/token.json                   # token OAuth2 (aggiornato da N8N)
 ```
-
-Tutto il resto — Python, librerie, script — è dentro il container.
 
 ---
 
 ## Installazione
 
-### 1. Vai nella cartella dove hai già il tuo docker-compose.yml
+### Passo 1 — Trova il nome della rete Docker esistente
 
 ```bash
 ssh user@ip-vps
-cd /opt/docker          # ← adatta al tuo percorso reale
+docker network ls
 ```
 
-### 2. Clona il repo come sottocartella
+Cerca la rete a cui sono collegati n8n e mariadb. Di solito ha il formato
+`nomecartella_default`. Se non sei sicuro:
 
 ```bash
+docker inspect n8n | grep -A5 '"Networks"'
+# oppure
+docker inspect mariadb | grep -A5 '"Networks"'
+```
+
+Prendi nota del nome: ti servirà nel passo 3.
+
+### Passo 2 — Clona il repo come sottocartella
+
+```bash
+ssh user@ip-vps
+cd dockercomposepath/          # la cartella dove hai già il tuo docker-compose.yml
 git clone <repo-url> python-utils
 ```
 
-### 3. Copia le credenziali Google dentro la sottocartella
+### Passo 3 — Crea il file .env
 
 ```bash
-# Dal tuo PC (non dal VPS)
-scp credentials.json token.json user@ip-vps:/opt/docker/python-utils/
+cp python-utils/.env.example python-utils/.env
+nano python-utils/.env
 ```
 
-> Se non hai ancora `token.json` vedi la sezione "Token Google OAuth2" in fondo.
-
-### 4. Aggiungi i due servizi al tuo docker-compose.yml esistente
-
-Apri `/opt/docker/docker-compose.yml` e aggiungi dentro `services:`:
-
-```yaml
-  python-utils:
-    build: ./python-utils
-    container_name: python-utils
-    restart: unless-stopped
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./python-utils/credentials.json:/app/credentials.json:ro
-      - ./python-utils/token.json:/app/token.json
-    environment:
-      GDRIVE_CREDENTIALS_FILE: /app/credentials.json
-      GDRIVE_TOKEN_FILE: /app/token.json
-    networks:
-      - <nome-rete-esistente>      # stesso nome della rete di n8n
-
-  claude-code:
-    build: ./python-utils/docker/claude-code
-    container_name: claude-code
-    restart: unless-stopped
-    environment:
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./python-utils:/workspace
-      - claude-config:/root/.claude
-      - ./python-utils/docker/claude-code/.mcp.json.example:/root/.claude/mcp.json:ro
-    networks:
-      - <nome-rete-esistente>
-    depends_on:
-      - python-utils
-    stdin_open: true
-    tty: true
-```
-
-Aggiungi `claude-config` nella sezione `volumes:` del tuo compose:
-
-```yaml
-volumes:
-  claude-config:
-```
-
-Aggiungi `ANTHROPIC_API_KEY` nel tuo `.env`:
+Compila i 3 valori:
 
 ```env
+DOCKER_NETWORK_NAME=nome_rete_trovato_al_passo_1
 ANTHROPIC_API_KEY=sk-ant-...
+DEPLOY_SECRET=stringa_casuale_lunga_almeno_32_caratteri
 ```
 
-### 5. Avvia i nuovi container
+### Passo 4 — Copia credentials.json
+
+Scarica `credentials.json` da Google Cloud Console (OAuth 2.0 client secret)
+e copialo sul VPS:
 
 ```bash
-docker compose up -d --build python-utils claude-code
+# Dal tuo PC
+scp credentials.json user@ip-vps:dockercomposepath/python-utils/
 ```
 
-### 6. Verifica
+Questo file non cambia mai. Non va committato.
+
+### Passo 5 — Genera token.json (solo la prima volta)
+
+Il token OAuth richiede un browser la prima volta. Fallo dal tuo PC:
 
 ```bash
-docker compose ps
-curl http://localhost:8000/health    # → {"status":"ok"}
+# Sul tuo PC
+pip install google-auth-oauthlib google-api-python-client pypdf
+python python-utils/scripts/gdrive_folder_to_pdf.py \
+  --src "URL_CARTELLA_QUALSIASI" --dst "URL_CARTELLA_QUALSIASI"
+# Si apre il browser → accedi → token.json viene creato
+
+# Copia sul VPS
+scp token.json user@ip-vps:dockercomposepath/python-utils/
+```
+
+Da quel momento **N8N gestisce il rinnovo** del token (vedi sezione dedicata).
+
+### Passo 6 — Avvia i container
+
+```bash
+# Da dockercomposepath/
+docker compose -f python-utils/docker-compose.yml up -d --build
+```
+
+### Passo 7 — Verifica
+
+```bash
+docker compose -f python-utils/docker-compose.yml ps
+# python-utils → healthy
+# claude-code  → running
+# webhook      → running
+
+# Testa l'API dall'interno della rete (come fa N8N)
+docker exec n8n wget -qO- http://python-utils:8000/health
+# → {"status":"ok"}
 ```
 
 ---
@@ -174,105 +183,153 @@ curl http://localhost:8000/health    # → {"status":"ok"}
 ### Manuale
 
 ```bash
-cd /opt/docker/python-utils
+ssh user@ip-vps
+cd dockercomposepath/python-utils
 git pull
 cd ..
-docker compose up -d --build python-utils
+docker compose -f python-utils/docker-compose.yml up -d --build python-utils
 ```
 
-### Automatico via webhook (push → deploy)
+### Automatico (push → deploy)
 
-Ogni volta che fai `git push`, il VPS si aggiorna da solo.
+Ogni `git push` triggera automaticamente `git pull` + rebuild sul VPS.
 
-**Aggiungi il servizio webhook al tuo docker-compose.yml:**
+**Configurazione GitHub:**
 
-```yaml
-  webhook:
-    build: ./python-utils/docker/webhook
-    container_name: webhook
-    restart: unless-stopped
-    ports:
-      - "9000:9000"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./python-utils:/repo          # repo da aggiornare con git pull
-      - .:/compose                    # cartella con docker-compose.yml
-    environment:
-      DEPLOY_SECRET: ${DEPLOY_SECRET}
-      REPO_PATH: /repo
-      COMPOSE_PATH: /compose
-      COMPOSE_SERVICES: python-utils
-    networks:
-      - <nome-rete-esistente>
-```
+1. Repo → Settings → Webhooks → Add webhook
+2. Payload URL: `http://ip-vps:9000/deploy`
+3. Content type: `application/json`
+4. Secret: il valore di `DEPLOY_SECRET` nel tuo `.env`
+5. Which events: solo **Push**
 
-Aggiungi nel tuo `.env`:
-
-```env
-DEPLOY_SECRET=scegli_una_stringa_segreta_lunga
-```
-
-Avvia il container:
-
-```bash
-docker compose up -d --build webhook
-```
-
-**Configura il webhook su Gitea/GitHub:**
-
-1. Vai nelle impostazioni del repo → **Webhooks** → Aggiungi webhook
-2. URL: `http://ip-vps:9000/deploy`
-3. Secret: il valore di `DEPLOY_SECRET`
-4. Content type: `application/json`
-5. Evento: solo **Push**
-
-Da quel momento ogni `git push` triggera automaticamente `git pull` + rebuild sul VPS.
+Il container `webhook` ha la propria immagine separata e non viene mai
+coinvolto nel rebuild — rimane sempre attivo durante gli aggiornamenti.
 
 ---
 
-## Usare Claude Code
+## API HTTP (per N8N)
+
+Tutti gli endpoint sono raggiungibili da N8N come `http://python-utils:8000`.
+Nessuna porta esposta all'esterno del VPS.
+
+Documentazione interattiva (Swagger): apri una sessione SSH con port-forward
+`ssh -L 8000:localhost:8000 user@ip-vps` poi vai su `http://localhost:8000/docs`.
+
+---
+
+### `GET /health`
+
+```
+GET http://python-utils:8000/health
+→ {"status": "ok"}
+```
+
+---
+
+### `POST /gdrive-to-pdf`
+
+Converte tutti i file di una cartella Google Drive in un unico PDF e lo
+carica nella cartella di destinazione.
+
+**Request:**
+```json
+{
+  "src": "https://drive.google.com/drive/folders/SOURCE_FOLDER_ID",
+  "dst": "https://drive.google.com/drive/folders/DEST_FOLDER_ID",
+  "output": "report_aprile_2026.pdf"
+}
+```
+
+| Campo | Obbligatorio | Default | Descrizione |
+|---|---|---|---|
+| `src` | si | — | URL o ID cartella Drive sorgente |
+| `dst` | si | — | URL o ID cartella Drive destinazione |
+| `output` | no | `merged.pdf` | Nome del PDF di output |
+
+**Formato supportati nella cartella sorgente:**
+Google Docs, Google Sheets, Google Slides, Google Drawings, file PDF.
+Gli altri formati vengono ignorati con un warning nel log.
+
+**Response:**
+```json
+{
+  "id": "1xYz_AbCdEfGhIjKlMnOpQr",
+  "name": "report_aprile_2026.pdf",
+  "webViewLink": "https://drive.google.com/file/d/1xYz.../view"
+}
+```
+
+**Nodo N8N — HTTP Request:**
+```
+Method:       POST
+URL:          http://python-utils:8000/gdrive-to-pdf
+Content-Type: application/json
+Body:
+{
+  "src":    "{{ $json.src_folder_url }}",
+  "dst":    "{{ $json.dst_folder_url }}",
+  "output": "{{ $json.output_name }}"
+}
+```
+
+---
+
+### `POST /auth/token` — Rinnovo token Google (chiamato da N8N)
+
+Aggiorna il file `token.json` con il nuovo access token ottenuto da Google.
+Da integrare nel workflow N8N che gestisce già i token di Shopify e Meta.
+
+**Flusso N8N:**
+
+```
+[Schedule / Trigger]
+        │
+        ▼
+[HTTP Request] POST https://oauth2.googleapis.com/token
+  Body:
+    grant_type=refresh_token
+    client_id={{$credentials.client_id}}
+    client_secret={{$credentials.client_secret}}
+    refresh_token={{$credentials.refresh_token}}
+        │
+        ▼ riceve: access_token, expires_in, ...
+        │
+        ▼
+[HTTP Request] POST http://python-utils:8000/auth/token
+  Body:
+    {
+      "access_token":  "{{ $json.access_token }}",
+      "refresh_token": "IL_TUO_REFRESH_TOKEN",
+      "client_id":     "IL_TUO_CLIENT_ID",
+      "client_secret": "IL_TUO_CLIENT_SECRET",
+      "expiry":        "{{ /* calcola: now + expires_in */ }}"
+    }
+```
+
+**Response:**
+```json
+{"status": "ok"}
+```
+
+> `refresh_token`, `client_id` e `client_secret` non cambiano mai:
+> salvali come credenziali in N8N e usale nelle espressioni.
+
+---
+
+## Claude Code (MCP)
+
+Il container `claude-code` ha il Docker socket montato e la config MCP
+già presente. Avvia una sessione interattiva con:
 
 ```bash
 docker exec -it claude-code claude
 ```
 
-I tool MCP sono già configurati e pronti.
+I tool MCP sono disponibili immediatamente nella sessione.
 
----
+### Tool disponibili
 
-## API HTTP per N8N
-
-### `POST /gdrive-to-pdf`
-
-Nel nodo **HTTP Request** di N8N:
-
-```
-Method:  POST
-URL:     http://python-utils:8000/gdrive-to-pdf
-Body:
-{
-  "src":    "https://drive.google.com/drive/folders/SOURCE_ID",
-  "dst":    "https://drive.google.com/drive/folders/DEST_ID",
-  "output": "report.pdf"
-}
-```
-
-Risposta:
-```json
-{
-  "id": "1xYz...",
-  "name": "report.pdf",
-  "webViewLink": "https://drive.google.com/file/d/1xYz.../view"
-}
-```
-
-Swagger UI: `http://ip-vps:8000/docs`
-
----
-
-## Tool MCP per Claude Code
-
-### `gdrive_folder_to_pdf`
+#### `gdrive_folder_to_pdf`
 
 | Parametro | Obbligatorio | Default | Descrizione |
 |---|---|---|---|
@@ -282,37 +339,45 @@ Swagger UI: `http://ip-vps:8000/docs`
 
 ---
 
-## Token Google OAuth2 (solo prima volta)
-
-Il token richiede un browser. Farlo dal tuo PC:
-
-```bash
-# Sul tuo PC
-pip install google-auth-oauthlib google-api-python-client pypdf
-python python-utils/scripts/gdrive_folder_to_pdf.py \
-  --src "URL_SORGENTE" --dst "URL_DESTINAZIONE"
-# Si apre il browser → autorizza → viene creato token.json
-
-# Copia sul VPS
-scp credentials.json token.json user@ip-vps:/opt/docker/python-utils/
-```
-
-Da quel momento il token si rinnova automaticamente.
-
----
-
-## Scripts disponibili
-
-| Script | Endpoint | Tool MCP | Descrizione |
-|---|---|---|---|
-| `scripts/gdrive_folder_to_pdf.py` | `POST /gdrive-to-pdf` | `gdrive_folder_to_pdf` | Cartella Drive → PDF unico |
-
----
-
 ## Aggiungere nuovi script
 
-1. Crea `scripts/nuovo_script.py` con funzione `run(...)`
-2. Registra il tool in `mcp_server.py`
-3. Aggiungi l'endpoint in `api_server.py`
-4. Aggiorna la tabella qui sopra
-5. `git push` → sul VPS `git pull && docker compose up -d --build python-utils`
+Per aggiungere un nuovo script al sistema:
+
+1. **Crea** `scripts/nome_script.py` con una funzione `run(...)` pubblica
+2. **Registra il tool MCP** in `mcp_server.py`:
+   - Aggiungi il tool in `list_tools()`
+   - Gestisci la chiamata in `call_tool()`
+3. **Aggiungi l'endpoint** in `api_server.py`
+4. **Aggiorna** la tabella "Scripts disponibili" qui sotto
+5. `git push` → deploy automatico via webhook
+
+### Scripts disponibili
+
+| Script | Endpoint HTTP | Tool MCP | Descrizione |
+|---|---|---|---|
+| `scripts/gdrive_folder_to_pdf.py` | `POST /gdrive-to-pdf` | `gdrive_folder_to_pdf` | Cartella Google Drive → PDF unico |
+
+---
+
+## Struttura del progetto
+
+```
+python-utils/
+├── scripts/
+│   ├── __init__.py
+│   └── gdrive_folder_to_pdf.py   ← logica script
+├── docker/
+│   ├── claude-code/
+│   │   ├── Dockerfile
+│   │   └── .mcp.json.example     ← config MCP (montata nel container)
+│   └── webhook/
+│       ├── Dockerfile
+│       └── server.py             ← webhook deploy
+├── api_server.py                 ← HTTP server per N8N
+├── mcp_server.py                 ← MCP server per Claude Code
+├── Dockerfile                    ← immagine python-utils
+├── docker-compose.yml            ← 3 container (python-utils, claude-code, webhook)
+├── pyproject.toml                ← dipendenze Python
+├── .env.example                  ← template variabili d'ambiente
+└── README.md
+```
