@@ -16,9 +16,11 @@ Endpoints:
 import logging
 
 from fastapi import FastAPI, HTTPException, UploadFile
+from pydantic import BaseModel
 from fastapi.responses import Response
 
 from scripts.merge_pdfs import merge
+from scripts.test_hello import hello
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -27,6 +29,15 @@ app = FastAPI(
     description="Utility API per N8N — espone script Python come endpoint REST.",
     version="0.2.0",
 )
+
+
+class HelloRequest(BaseModel):
+    name: str
+
+
+@app.post("/test-hello")
+async def test_hello(body: HelloRequest) -> dict:
+    return {"message": hello(body.name)}
 
 
 @app.get("/health")
