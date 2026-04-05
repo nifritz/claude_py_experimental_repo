@@ -33,7 +33,7 @@ git clone <repo-url> python-utils
 
 ### 2 — Aggiungi i servizi al tuo docker-compose.yml
 
-Copia questi 3 blocchi nel tuo `docker-compose.yml` esistente, nella sezione `services:`:
+Copia questi 3 blocchi nella sezione `services:`:
 
 ```yaml
   python-utils:
@@ -56,7 +56,7 @@ Copia questi 3 blocchi nel tuo `docker-compose.yml` esistente, nella sezione `se
     container_name: claude-code
     restart: unless-stopped
     environment:
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./python-utils:/workspace
@@ -81,15 +81,21 @@ Copia questi 3 blocchi nel tuo `docker-compose.yml` esistente, nella sezione `se
       - ./python-utils:/repo
       - ./:/compose
     environment:
-      DEPLOY_SECRET: ${DEPLOY_SECRET}
-      COMPOSE_SERVICES: python-utils
+      - DEPLOY_SECRET=${DEPLOY_SECRET}
+      - COMPOSE_SERVICES=python-utils
 ```
 
-Aggiungi anche il volume nella sezione `volumes:`:
+Aggiungi `claude-config` nella sezione `volumes:` in fondo al file:
 
 ```yaml
 volumes:
-  claude-config:
+  npm_data:
+  npm_letsencrypt:
+  n8n_data:
+  vikunja-data-final:
+  vikunja-db-final:
+  filebrowser-db:
+  claude-config:      # ← aggiungi solo questa riga
 ```
 
 ### 3 — Aggiungi le variabili al tuo .env
