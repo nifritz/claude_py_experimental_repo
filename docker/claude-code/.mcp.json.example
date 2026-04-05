@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "python-utils": {
+      "command": "docker",
+      "args": [
+        "exec", "-i", "python-utils",
+        "python", "/app/mcp_server.py"
+      ],
+      "env": {
+        "GDRIVE_CREDENTIALS_FILE": "/app/credentials.json",
+        "GDRIVE_TOKEN_FILE": "/app/token.json"
+      }
+    }
+  }
+}

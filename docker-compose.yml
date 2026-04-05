@@ -1,0 +1,100 @@
+version: "3.9"
+
+# =============================================================================
+# Stack Python utilities — da aggiungere allo stack Docker esistente
+#
+# PRIMA DI AVVIARE:
+#   1. Crea il file .env (copia da .env.example e compila i valori)
+#   2. Copia credentials.json e token.json in questa cartella
+#
+# AVVIO:
+#   cd dockercomposepath/
+#   docker compose -f python-utils/docker-compose.yml up -d --build
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # python-utils — API HTTP (N8N) + MCP server (Claude Code)
+  # Raggiungibile internamente come: http://python-utils:8000
+  # Nessuna porta esposta all'esterno.
+  # ---------------------------------------------------------------------------
+  python-utils:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: python-utils
+    restart: unless-stopped
+    volumes:
+      - ./credentials.json:/app/credentials.json:ro
+      - ./token.json:/app/token.json
+    environment:
+      GDRIVE_CREDENTIALS_FILE: /app/credentials.json
+      GDRIVE_TOKEN_FILE: /app/token.json
+    networks:
+      - existing-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # claude-code — Claude Code CLI con accesso MCP a python-utils
+  # Uso: docker exec -it claude-code claude
+  # ---------------------------------------------------------------------------
+  claude-code:
+    build:
+      context: ./docker/claude-code
+      dockerfile: Dockerfile
+    container_name: claude-code
+    restart: unless-stopped
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/workspace
+      - claude-config:/root/.claude
+      - ./docker/claude-code/.mcp.json.example:/root/.claude/mcp.json:ro
+    networks:
+      - existing-net
+    depends_on:
+      python-utils:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+
+  # ---------------------------------------------------------------------------
+  # webhook — deploy automatico al push su GitHub
+  # Porta 9000 esposta: GitHub chiama dall'esterno.
+  # NON viene mai rebuilt dallo script deploy (rimane sempre attivo).
+  # ---------------------------------------------------------------------------
+  webhook:
+    build:
+      context: ./docker/webhook
+      dockerfile: Dockerfile
+    container_name: webhook
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/repo
+      - ..:/compose
+    environment:
+      DEPLOY_SECRET: ${DEPLOY_SECRET}
+      REPO_PATH: /repo
+      COMPOSE_PATH: /compose
+      COMPOSE_FILE: python-utils/docker-compose.yml
+      COMPOSE_SERVICES: python-utils
+    networks:
+      - existing-net
+
+volumes:
+  claude-config:
+
+networks:
+  existing-net:
+    external: true
+    name: ${DOCKER_NETWORK_NAME}
