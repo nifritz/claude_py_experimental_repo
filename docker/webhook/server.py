@@ -53,6 +53,7 @@ async def deploy(
 
     log.info("Deploy avviato...")
     try:
+        _run(["git", "stash"], cwd=REPO_PATH)
         out_pull = _run(["git", "pull"], cwd=REPO_PATH)
         log.info("git pull: %s", out_pull)
 
