@@ -9,25 +9,19 @@ Transport: stdio (standard MCP transport for subprocess invocation)
 
 Usage:
     python mcp_server.py
-
-Configuration in Claude Code (.mcp.json or settings):
-    See README.md → "Integrazione MCP"
 """
 
 import asyncio
 import logging
-import os
+from pathlib import Path
 
+from mcp import types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp import types
 
-from scripts.gdrive_folder_to_pdf import run as gdrive_to_pdf_run
+from scripts.merge_pdfs import merge
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-
-CREDENTIALS_FILE = os.environ.get("GDRIVE_CREDENTIALS_FILE", "credentials.json")
-TOKEN_FILE = os.environ.get("GDRIVE_TOKEN_FILE", "token.json")
 
 server = Server("python-utils")
 
@@ -36,30 +30,26 @@ server = Server("python-utils")
 async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
-            name="gdrive_folder_to_pdf",
+            name="merge_pdfs",
             description=(
-                "Converte tutti i file in una cartella Google Drive "
-                "(Docs, Sheets, Slides, PDF) in un unico PDF unificato "
-                "e lo carica in una cartella Drive di destinazione. "
-                "Restituisce il link Google Drive del file caricato."
+                "Unisce più file PDF in un unico PDF. "
+                "Accetta una lista di percorsi file all'interno del workspace "
+                "e salva il risultato nel percorso indicato."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "src": {
-                        "type": "string",
-                        "description": "URL o ID della cartella Drive sorgente",
-                    },
-                    "dst": {
-                        "type": "string",
-                        "description": "URL o ID della cartella Drive di destinazione",
+                    "files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Lista di percorsi dei file PDF da unire (in ordine)",
                     },
                     "output": {
                         "type": "string",
-                        "description": "Nome del file PDF di output (default: merged.pdf)",
+                        "description": "Percorso del file PDF di output",
                     },
                 },
-                "required": ["src", "dst"],
+                "required": ["files", "output"],
             },
         ),
     ]
@@ -67,18 +57,24 @@ async def list_tools() -> list[types.Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
-    if name == "gdrive_folder_to_pdf":
-        result = gdrive_to_pdf_run(
-            src_url=arguments["src"],
-            dst_url=arguments["dst"],
-            output_name=arguments.get("output", "merged.pdf"),
-            credentials_file=CREDENTIALS_FILE,
-            token_file=TOKEN_FILE,
-        )
+    if name == "merge_pdfs":
+        file_paths: list[str] = arguments["files"]
+        output_path: str = arguments["output"]
+
+        pdf_bytes_list: list[bytes] = []
+        for path in file_paths:
+            p = Path(path)
+            if not p.exists():
+                raise FileNotFoundError(f"File non trovato: {path!r}")
+            pdf_bytes_list.append(p.read_bytes())
+
+        merged = merge(pdf_bytes_list)
+        Path(output_path).write_bytes(merged)
+
         return [
             types.TextContent(
                 type="text",
-                text=f"PDF caricato con successo.\nLink: {result['webViewLink']}\nFile ID: {result['id']}\nNome: {result['name']}",
+                text=f"PDF uniti con successo ({len(file_paths)} file).\nSalvato in: {output_path}",
             )
         ]
 

@@ -2,67 +2,31 @@
 """
 api_server.py
 
-HTTP REST API server che espone gli script Python come endpoint REST
-per N8N e altri client HTTP.
+HTTP REST API server that exposes Python utility scripts as endpoints
+callable by N8N or any HTTP client.
+
+N8N handles Google Drive auth. It downloads files, sends them here as
+multipart/form-data, and uploads the result back to Drive.
 
 Endpoints:
     GET  /health              → health check
-    POST /gdrive-to-pdf       → converti cartella Drive in PDF
-    POST /auth/token          → aggiorna il token Google OAuth2 (chiamato da N8N)
+    POST /merge-pdfs          → merge uploaded PDFs into one
 """
 
-import json
 import logging
-import os
-from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi.responses import Response
 
-from scripts.gdrive_folder_to_pdf import run as gdrive_to_pdf_run
+from scripts.merge_pdfs import merge
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-
-CREDENTIALS_FILE = os.environ.get("GDRIVE_CREDENTIALS_FILE", "credentials.json")
-TOKEN_FILE = os.environ.get("GDRIVE_TOKEN_FILE", "token.json")
 
 app = FastAPI(
     title="Python Utils API",
     description="Utility API per N8N — espone script Python come endpoint REST.",
-    version="0.1.0",
+    version="0.2.0",
 )
-
-
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
-
-
-class GdriveToPdfRequest(BaseModel):
-    src: str
-    dst: str
-    output: str = "merged.pdf"
-
-
-class GdriveToPdfResponse(BaseModel):
-    id: str
-    name: str
-    webViewLink: str
-
-
-class GoogleTokenRequest(BaseModel):
-    access_token: str
-    refresh_token: str
-    token_uri: str = "https://oauth2.googleapis.com/token"
-    client_id: str
-    client_secret: str
-    scopes: list[str] = []
-    expiry: str | None = None
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 
 
 @app.get("/health")
@@ -71,52 +35,41 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/gdrive-to-pdf", response_model=GdriveToPdfResponse)
-async def gdrive_to_pdf(body: GdriveToPdfRequest) -> GdriveToPdfResponse:
+@app.post("/merge-pdfs")
+async def merge_pdfs(
+    files: list[UploadFile],
+    output: str = "merged.pdf",
+) -> Response:
     """
-    Converte tutti i file di una cartella Google Drive in un unico PDF
-    e lo carica nella cartella di destinazione.
+    Unisce più file PDF in un unico PDF.
+
+    N8N invia i file come multipart/form-data (campo: files).
+    Risponde con il PDF binario (application/pdf).
+
+    Flusso N8N tipico:
+      1. Google Drive → scarica ogni file come PDF (export)
+      2. HTTP Request POST /merge-pdfs  ← questo endpoint
+      3. Google Drive → carica il PDF ricevuto nella cartella destinazione
     """
+    if not files:
+        raise HTTPException(status_code=422, detail="Nessun file fornito")
+
+    pdf_bytes_list: list[bytes] = []
+    for f in files:
+        content = await f.read()
+        if not content:
+            raise HTTPException(status_code=422, detail=f"File vuoto: {f.filename!r}")
+        pdf_bytes_list.append(content)
+        logging.info("Ricevuto: %s (%d bytes)", f.filename, len(content))
+
     try:
-        result = gdrive_to_pdf_run(
-            src_url=body.src,
-            dst_url=body.dst,
-            output_name=body.output,
-            credentials_file=CREDENTIALS_FILE,
-            token_file=TOKEN_FILE,
-        )
-        return GdriveToPdfResponse(
-            id=result["id"],
-            name=result["name"],
-            webViewLink=result["webViewLink"],
-        )
+        merged = merge(pdf_bytes_list)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-
-@app.post("/auth/token")
-async def update_token(body: GoogleTokenRequest) -> dict:
-    """
-    Aggiorna il token Google OAuth2 salvato in token.json.
-
-    Chiamato da N8N dopo aver ottenuto un nuovo access_token da Google
-    (POST https://oauth2.googleapis.com/token).
-
-    N8N deve passare tutti i campi ricevuti da Google più client_id,
-    client_secret e refresh_token (che N8N custodisce).
-    """
-    token_data = {
-        "token": body.access_token,
-        "refresh_token": body.refresh_token,
-        "token_uri": body.token_uri,
-        "client_id": body.client_id,
-        "client_secret": body.client_secret,
-        "scopes": body.scopes,
-        "expiry": body.expiry,
-    }
-    try:
-        Path(TOKEN_FILE).write_text(json.dumps(token_data, indent=2))
-        logging.info("token.json aggiornato da N8N")
-        return {"status": "ok"}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    logging.info("Merged %d file(s) → %d bytes", len(pdf_bytes_list), len(merged))
+    return Response(
+        content=merged,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{output}"'},
+    )

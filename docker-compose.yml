@@ -25,12 +25,7 @@ services:
       dockerfile: Dockerfile
     container_name: python-utils
     restart: unless-stopped
-    volumes:
-      - ./credentials.json:/app/credentials.json:ro
-      - ./token.json:/app/token.json
-    environment:
-      GDRIVE_CREDENTIALS_FILE: /app/credentials.json
-      GDRIVE_TOKEN_FILE: /app/token.json
+    # Nessun volume per credenziali: N8N gestisce l'auth Google Drive
     networks:
       - existing-net
     healthcheck:
