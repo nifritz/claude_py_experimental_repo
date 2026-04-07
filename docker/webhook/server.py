@@ -69,6 +69,9 @@ async def deploy(
         )
         log.info("docker compose: %s", out_compose)
 
+        _run(["docker", "image", "prune", "-f"], cwd=COMPOSE_PATH)
+        log.info("Immagini vecchie rimosse")
+
     except RuntimeError as e:
         log.error("%s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
