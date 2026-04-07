@@ -11,15 +11,20 @@ multipart/form-data, and uploads the result back to Drive.
 Endpoints:
     GET  /health              → health check
     POST /merge-pdfs          → merge uploaded PDFs into one
+    POST /split-grid          → split a sprite sheet into individual cells (base64 PNG)
 """
 
+import io
 import logging
 
+import requests as http_requests
 from fastapi import FastAPI, HTTPException, UploadFile
 from pydantic import BaseModel
 from fastapi.responses import Response
+from PIL import Image
 
 from scripts.merge_pdfs import merge
+from scripts.split_grid import split
 from scripts.test_hello import hello
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -35,9 +40,46 @@ class HelloRequest(BaseModel):
     name: str
 
 
+class SplitGridRequest(BaseModel):
+    image_url: str
+    rows: int
+    cols: int
+
+
 @app.post("/test-hello")
 async def test_hello(body: HelloRequest) -> dict:
     return {"message": hello(body.name)}
+
+
+@app.post("/split-grid")
+def split_grid(req: SplitGridRequest) -> dict:
+    """
+    Divide una sprite sheet in celle singole con autocrop e padding.
+
+    Body JSON: {"image_url": "https://...", "rows": 2, "cols": 5}
+    Response : {"images": [{"base64": "...", "index": 0}, ...]}
+
+    Usato dall'workflow n8n "Genera Prodotto Shopify Bimbi Unici".
+    """
+    if req.rows <= 0 or req.cols <= 0:
+        raise HTTPException(status_code=400, detail="rows e cols devono essere > 0")
+    if req.rows > 10 or req.cols > 10:
+        raise HTTPException(status_code=400, detail="rows e cols devono essere <= 10")
+
+    try:
+        resp = http_requests.get(req.image_url, timeout=30)
+        resp.raise_for_status()
+    except http_requests.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Errore download immagine: {e}") from e
+
+    try:
+        img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Immagine non valida: {e}") from e
+
+    images = split(img, req.rows, req.cols)
+    logging.info("split-grid: %dx%d → %d celle", req.rows, req.cols, len(images))
+    return {"images": images}
 
 
 @app.get("/health")
