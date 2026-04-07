@@ -64,7 +64,8 @@ async def deploy(
         log.info("git pull: %s", out_pull)
 
         out_compose = _run(
-            ["docker", "compose", "up", "-d", "--build", *COMPOSE_SERVICES],
+            ["docker", "compose", "-p", "automazioni", "-f", "/compose/docker-compose.yml",
+             "up", "-d", "--build", *COMPOSE_SERVICES],
             cwd=COMPOSE_PATH,
         )
         log.info("docker compose: %s", out_compose)
