@@ -4,25 +4,33 @@ This file provides guidance to AI assistants (Claude Code and similar tools) wor
 
 ## Repository Overview
 
-**Purpose**: An experimental Python repository for exploring Claude Code capabilities and Python development patterns.
+**Purpose**: Python backend che espone tool HTTP (via FastAPI) consumati da workflow N8N.
 
 - **Language**: Python
-- **Status**: Early-stage / experimental
-- **Description**: "Esperimenti con Claude code in Python" — experiments with Claude Code in Python
+- **Status**: Attivo / in crescita
+- **Utilizzo principale**: N8N chiama endpoint specifici di `api_server.py` per operazioni su immagini, PDF e altro
 
 ## Repository Structure
 
 ```
 claude_py_experimental_repo/
-├── .gitignore       # Comprehensive Python gitignore
-├── README.md        # Project description
-└── CLAUDE.md        # This file
+├── api_server.py          # FastAPI app — entry point principale, endpoint chiamati da N8N
+├── scripts/               # Logica pura dei tool (importata da api_server.py)
+│   ├── merge_pdfs.py
+│   ├── split_grid.py
+│   └── test_hello.py
+├── mcp_servers/           # Scheletro MCP (completato ma non utilizzato al momento)
+│   ├── data.py
+│   ├── images.py
+│   └── pdf.py
+├── docker/
+│   ├── webhook/
+│   │   └── server.py      # Webhook server per deploy automatico — NON TOCCARE (vedi sotto)
+│   └── claude-code/       # Dockerfile per ambiente Claude Code
+├── Dockerfile             # Build dell'api_server
+├── pyproject.toml         # Dipendenze e configurazione progetto
+└── .env.example           # Variabili d'ambiente richieste
 ```
-
-No source code exists yet. As the project grows, expect directories such as:
-- `src/` or a top-level package directory for application code
-- `tests/` for test files
-- `pyproject.toml` or `setup.py` for packaging and dependencies
 
 ## Git Workflow
 
@@ -38,8 +46,6 @@ No source code exists yet. As the project grows, expect directories such as:
 - Push with: `git push -u origin <branch-name>`
 
 ## Python Conventions
-
-Since no source code exists yet, follow these conventions when adding code:
 
 ### Style
 - Follow [PEP 8](https://peps.python.org/pep-0008/) for formatting
@@ -68,26 +74,35 @@ Since no source code exists yet, follow these conventions when adding code:
 
 ## Working with This Repository
 
-### Adding new experiments
-1. Create a clearly named Python file or package
-2. Add a corresponding test file under `tests/`
-3. Update `README.md` to document what the experiment does
+### Aggiungere un nuovo tool/endpoint
+1. Creare il file logica in `scripts/<nome>.py` (funzione pura, nessun riferimento HTTP)
+2. Importarlo e registrare l'endpoint in `api_server.py`
+3. **Aggiornare `pyproject.toml`** se lo script richiede nuove librerie — è la fonte di verità per le dipendenze
+4. Aggiornare `README.md` per documentare l'endpoint
 
-### When setting up the project for the first time
-1. Create `pyproject.toml` with project metadata and dependencies
-2. Initialize a virtual environment: `python -m venv .venv` or `uv venv`
-3. Install dependencies: `pip install -e .[dev]` or `uv sync`
-4. Configure Ruff and pytest in `pyproject.toml`
+### Setup iniziale
+1. Inizializzare un virtual environment: `python -m venv .venv` o `uv venv`
+2. Installare dipendenze: `pip install -e .[dev]` o `uv sync`
 
 ### Running code
-Until a proper entry point exists, run scripts directly: `python <script.py>`
+```bash
+uvicorn api_server:app --reload
+```
 
 ## Notes for AI Assistants
 
-- This is an experimental repo — expect code to change frequently
 - Prefer editing existing files over creating new ones unless a new file is clearly needed
-- Keep experiments self-contained; avoid cross-dependencies between unrelated experiments
 - Do not add unnecessary abstractions — keep code simple and readable
 - Do not commit secrets, credentials, or `.env` files
 - Always work on the designated feature branch, not `main`
 - When in doubt about scope, ask before making large structural changes
+- When adding a new script that requires new libraries, always update `pyproject.toml` accordingly
+
+### MCP servers
+La cartella `mcp_servers/` contiene uno scheletro MCP completato ma **non attualmente utilizzato**. Non sviluppare ulteriormente questa parte salvo indicazione esplicita.
+
+### N8N integration
+Il flusso principale è: **N8N → POST endpoint su `api_server.py` → funzione in `scripts/`**. Ogni nuovo tool deve seguire questo pattern.
+
+### ⚠️ NON toccare `docker/webhook/server.py`
+Questo file gestisce il deploy automatico via webhook su Hostinger. In passato un bug causava la creazione di due istanze Docker Compose separate, mandando in crash il pannello web di Hostinger. Il problema era l'assenza del nome progetto esplicito nel comando `docker compose`. La fix è stata aggiungere `-p automazioni` e `-f /compose/docker-compose.yml` esplicitamente. Il file ora funziona correttamente — **non modificarlo** senza istruzioni esplicite.
