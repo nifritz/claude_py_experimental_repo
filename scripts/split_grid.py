@@ -8,8 +8,8 @@ Contratto (usato dall'endpoint POST /split-grid in api_server.py):
 
 Logica di split:
     1. Divide l'immagine in celle di dimensione uguale (width/cols x height/rows)
-    2. Per ogni cella fa autocrop del whitespace bianco ai bordi (soglia 240/255)
-    3. Aggiunge padding uniforme attorno al soggetto ritagliato
+    2. Trova il componente connesso più grande (= soggetto); blank di tutto il resto
+    3. Calcola il bounding box del soggetto e aggiunge padding uniforme
     4. Quadra la cella (sfondo bianco, soggetto centrato)
     5. Restituisce ogni cella come PNG base64
     Index: 0=top-left, incrementa sinistra->destra, riga per riga, ultimo=bottom-right
@@ -27,43 +27,85 @@ WHITE_THRESHOLD = 240
 CONTENT_PADDING = 15
 
 
+def _largest_connected_component(rgb: Image.Image) -> set[tuple[int, int]]:
+    """
+    Restituisce l'insieme di coordinate (x, y) del componente connesso più grande
+    tra i pixel non-bianchi. Connettività 4 (N/S/E/W).
+    Restituisce un insieme vuoto se la cella è tutta bianca.
+    """
+    w, h = rgb.size
+    pixels = rgb.load()
+
+    dark: set[tuple[int, int]] = set()
+    for y in range(h):
+        for x in range(w):
+            r, g, b = pixels[x, y]
+            if r < WHITE_THRESHOLD or g < WHITE_THRESHOLD or b < WHITE_THRESHOLD:
+                dark.add((x, y))
+
+    if not dark:
+        return set()
+
+    visited: set[tuple[int, int]] = set()
+    largest: set[tuple[int, int]] = set()
+
+    for start in dark:
+        if start in visited:
+            continue
+        component: set[tuple[int, int]] = set()
+        queue = [start]
+        visited.add(start)
+        while queue:
+            x, y = queue.pop()
+            component.add((x, y))
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if (nx, ny) in dark and (nx, ny) not in visited:
+                    visited.add((nx, ny))
+                    queue.append((nx, ny))
+        if len(component) > len(largest):
+            largest = component
+
+    return largest
+
+
 def autocrop_and_pad(cell: Image.Image) -> Image.Image:
     """
-    Trova il bounding box del contenuto non-bianco, aggiunge padding,
-    poi crea un'immagine quadrata con sfondo bianco e contenuto centrato.
+    Isola il soggetto principale (componente connesso più grande tra i pixel non-bianchi),
+    rimuove tutto il resto, poi crea un'immagine quadrata con sfondo bianco e soggetto centrato.
     Se la cella è tutta bianca la restituisce invariata (come quadrato bianco).
     """
     rgb = cell.convert("RGB")
     w, h = rgb.size
 
-    min_x, min_y, max_x, max_y = w, h, 0, 0
-    found = False
+    subject = _largest_connected_component(rgb)
 
-    pixels = rgb.load()
-    for y in range(h):
-        for x in range(w):
-            r, g, b = pixels[x, y]
-            if r < WHITE_THRESHOLD or g < WHITE_THRESHOLD or b < WHITE_THRESHOLD:
-                if x < min_x:
-                    min_x = x
-                if x > max_x:
-                    max_x = x
-                if y < min_y:
-                    min_y = y
-                if y > max_y:
-                    max_y = y
-                found = True
-
-    if not found:
+    if not subject:
         side = min(w, h)
         return Image.new("RGBA", (side, side), (255, 255, 255, 255))
+
+    min_x = min(x for x, _ in subject)
+    max_x = max(x for x, _ in subject)
+    min_y = min(y for _, y in subject)
+    max_y = max(y for _, y in subject)
+
+    # Blank di tutti i pixel non-bianchi che non appartengono al soggetto
+    cell_rgba = cell.convert("RGBA")
+    rgb_pix = rgb.load()
+    out_pix = cell_rgba.load()
+    for y in range(h):
+        for x in range(w):
+            r, g, b = rgb_pix[x, y]
+            if (r < WHITE_THRESHOLD or g < WHITE_THRESHOLD or b < WHITE_THRESHOLD) and (
+                x, y
+            ) not in subject:
+                out_pix[x, y] = (255, 255, 255, 255)
 
     left = max(0, min_x - CONTENT_PADDING)
     top = max(0, min_y - CONTENT_PADDING)
     right = min(w, max_x + CONTENT_PADDING + 1)
     bottom = min(h, max_y + CONTENT_PADDING + 1)
 
-    cropped = cell.crop((left, top, right, bottom)).convert("RGBA")
+    cropped = cell_rgba.crop((left, top, right, bottom))
 
     side = max(cropped.width, cropped.height)
     square = Image.new("RGBA", (side, side), (255, 255, 255, 255))
