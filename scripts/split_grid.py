@@ -8,10 +8,11 @@ Contratto (usato dall'endpoint POST /split-grid in api_server.py):
 
 Logica di split:
     1. Divide l'immagine in celle di dimensione uguale (width/cols x height/rows)
-    2. Trova il componente connesso più grande (= soggetto); blank di tutto il resto
-    3. Calcola il bounding box del soggetto e aggiunge padding uniforme
-    4. Quadra la cella (sfondo bianco, soggetto centrato)
-    5. Restituisce ogni cella come PNG base64
+    2. Trova il componente connesso più grande (= soggetto)
+    3. BFS dal bordo: pixel non-bianchi raggiungibili senza attraversare il soggetto = sporcizia esterna
+    4. Blank delle sole sporcizie esterne; contenuto interno al soggetto (buchi, dettagli) intatto
+    5. Bounding box del soggetto + padding, quadratura e centramento
+    6. Restituisce ogni cella come PNG base64
     Index: 0=top-left, incrementa sinistra->destra, riga per riga, ultimo=bottom-right
 """
 
@@ -68,10 +69,58 @@ def _largest_connected_component(rgb: Image.Image) -> set[tuple[int, int]]:
     return largest
 
 
+def _external_noise(
+    subject: set[tuple[int, int]],
+    rgb: Image.Image,
+) -> set[tuple[int, int]]:
+    """
+    BFS dal bordo della cella attraverso tutti i pixel NON appartenenti al soggetto.
+    Restituisce i pixel non-bianchi raggiungibili: sono sporcizie esterne al soggetto.
+    I pixel non-bianchi NON raggiungibili (interni al soggetto) vengono ignorati e conservati.
+    """
+    w, h = rgb.size
+    pixels = rgb.load()
+
+    visited: set[tuple[int, int]] = set()
+    queue: list[tuple[int, int]] = []
+
+    # Parti da tutti i pixel sul bordo della cella che non sono soggetto
+    for x in range(w):
+        for y in (0, h - 1):
+            if (x, y) not in subject and (x, y) not in visited:
+                visited.add((x, y))
+                queue.append((x, y))
+    for y in range(1, h - 1):
+        for x in (0, w - 1):
+            if (x, y) not in subject and (x, y) not in visited:
+                visited.add((x, y))
+                queue.append((x, y))
+
+    noise: set[tuple[int, int]] = set()
+
+    while queue:
+        x, y = queue.pop()
+        r, g, b = pixels[x, y]
+        if r < WHITE_THRESHOLD or g < WHITE_THRESHOLD or b < WHITE_THRESHOLD:
+            noise.add((x, y))
+        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            if (
+                0 <= nx < w
+                and 0 <= ny < h
+                and (nx, ny) not in subject
+                and (nx, ny) not in visited
+            ):
+                visited.add((nx, ny))
+                queue.append((nx, ny))
+
+    return noise
+
+
 def autocrop_and_pad(cell: Image.Image) -> Image.Image:
     """
-    Isola il soggetto principale (componente connesso più grande tra i pixel non-bianchi),
-    rimuove tutto il resto, poi crea un'immagine quadrata con sfondo bianco e soggetto centrato.
+    Isola il soggetto principale e rimuove le sole sporcizie esterne ad esso.
+    I dettagli interni (buchi, scritte, aree scure racchiuse dal soggetto) vengono conservati.
+    Crea un'immagine quadrata con sfondo bianco e soggetto centrato.
     Se la cella è tutta bianca la restituisce invariata (come quadrato bianco).
     """
     rgb = cell.convert("RGB")
@@ -83,22 +132,17 @@ def autocrop_and_pad(cell: Image.Image) -> Image.Image:
         side = min(w, h)
         return Image.new("RGBA", (side, side), (255, 255, 255, 255))
 
+    noise = _external_noise(subject, rgb)
+
     min_x = min(x for x, _ in subject)
     max_x = max(x for x, _ in subject)
     min_y = min(y for _, y in subject)
     max_y = max(y for _, y in subject)
 
-    # Blank di tutti i pixel non-bianchi che non appartengono al soggetto
     cell_rgba = cell.convert("RGBA")
-    rgb_pix = rgb.load()
     out_pix = cell_rgba.load()
-    for y in range(h):
-        for x in range(w):
-            r, g, b = rgb_pix[x, y]
-            if (r < WHITE_THRESHOLD or g < WHITE_THRESHOLD or b < WHITE_THRESHOLD) and (
-                x, y
-            ) not in subject:
-                out_pix[x, y] = (255, 255, 255, 255)
+    for x, y in noise:
+        out_pix[x, y] = (255, 255, 255, 255)
 
     left = max(0, min_x - CONTENT_PADDING)
     top = max(0, min_y - CONTENT_PADDING)
