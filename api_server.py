@@ -12,6 +12,7 @@ Endpoints:
     GET  /health              → health check
     POST /merge-pdfs          → merge uploaded PDFs into one
     POST /split-grid          → split a sprite sheet into individual cells (base64 PNG)
+    POST /approssima-colori   → riduce i colori di un'immagine alla palette hardcodata
 """
 
 import io
@@ -23,6 +24,8 @@ from pydantic import BaseModel
 from fastapi.responses import Response
 from PIL import Image
 
+from scripts.approssima_colori import approssima
+from scripts.approssima_colori import to_base64_png as approssima_to_base64
 from scripts.merge_pdfs import merge
 from scripts.split_grid import split
 from scripts.test_hello import hello
@@ -44,6 +47,11 @@ class SplitGridRequest(BaseModel):
     image_url: str
     rows: int
     cols: int
+
+
+class ApprossimaColoriRequest(BaseModel):
+    image_url: str
+    n_colori: int = 4
 
 
 @app.post("/test-hello")
@@ -80,6 +88,33 @@ def split_grid(req: SplitGridRequest) -> dict:
     images = split(img, req.rows, req.cols)
     logging.info("split-grid: %dx%d → %d celle", req.rows, req.cols, len(images))
     return {"images": images}
+
+
+@app.post("/approssima-colori")
+def approssima_colori(req: ApprossimaColoriRequest) -> dict:
+    """
+    Riduce i colori di un'immagine ai N più vicini dalla palette hardcodata.
+
+    Body JSON: {"image_url": "https://...", "n_colori": 4}
+    Response : {"base64": "<png base64>"}
+    """
+    if req.n_colori <= 0:
+        raise HTTPException(status_code=400, detail="n_colori deve essere > 0")
+
+    try:
+        resp = http_requests.get(req.image_url, timeout=30)
+        resp.raise_for_status()
+    except http_requests.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Errore download immagine: {e}") from e
+
+    try:
+        img = Image.open(io.BytesIO(resp.content))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Immagine non valida: {e}") from e
+
+    result = approssima(img, req.n_colori)
+    logging.info("approssima-colori: %d colori richiesti", req.n_colori)
+    return {"base64": approssima_to_base64(result)}
 
 
 @app.get("/health")
