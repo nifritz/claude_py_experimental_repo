@@ -2,18 +2,27 @@
 """
 split_grid.py — Logica per dividere una sprite sheet in celle singole.
 
-Contratto (usato dall'endpoint POST /split-grid in api_server.py):
+Contratto split() — usato dall'endpoint POST /split-grid:
     Input : immagine PIL già aperta in RGBA, rows: int, cols: int
     Output: lista di dict {"base64": str, "index": int}
 
-Logica di split:
-    1. Divide l'immagine in celle di dimensione uguale (width/cols x height/rows)
-    2. Trova il componente connesso più grande (= soggetto)
-    3. BFS dal bordo: pixel non-bianchi raggiungibili senza attraversare il soggetto = sporcizia esterna
-    4. Blank delle sole sporcizie esterne; contenuto interno al soggetto (buchi, dettagli) intatto
-    5. Bounding box del soggetto + padding, quadratura e centramento
-    6. Restituisce ogni cella come PNG base64
+    Logica di split:
+        1. Divide l'immagine in celle di dimensione uguale (width/cols x height/rows)
+        2. Trova il componente connesso più grande (= soggetto)
+        3. BFS dal bordo: pixel non-bianchi raggiungibili senza attraversare il soggetto = sporcizia esterna
+        4. Blank delle sole sporcizie esterne; contenuto interno al soggetto (buchi, dettagli) intatto
+        5. Bounding box del soggetto + padding, quadratura e centramento
+        6. Restituisce ogni cella come PNG base64
     Index: 0=top-left, incrementa sinistra->destra, riga per riga, ultimo=bottom-right
+
+Contratto split_by_count() — usato dall'endpoint POST /split-grid-count:
+    Input : immagine PIL già aperta in RGBA, n: int
+    Output: lista di dict {"base64": str, "index": int}
+
+    Logica: cerca i n componenti connessi più grandi nell'intera immagine (non divide
+    per griglia), estrae la bounding box di ciascuno, rimuove rumore esterno col BFS
+    e restituisce immagini quadrate centrate su sfondo bianco.
+    Robusto a griglie irregolari generate da AI.
 """
 
 import base64
@@ -164,6 +173,100 @@ def to_base64_png(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.convert("RGBA").save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _find_all_components(rgb: Image.Image) -> list[set[tuple[int, int]]]:
+    """
+    Trova tutti i componenti connessi di pixel non-bianchi nell'intera immagine.
+    Restituisce la lista ordinata per dimensione decrescente (il più grande prima).
+    Connettività 4 (N/S/E/W).
+    """
+    w, h = rgb.size
+    pixels = rgb.load()
+
+    dark: set[tuple[int, int]] = set()
+    for y in range(h):
+        for x in range(w):
+            r, g, b = pixels[x, y]
+            if r < WHITE_THRESHOLD or g < WHITE_THRESHOLD or b < WHITE_THRESHOLD:
+                dark.add((x, y))
+
+    if not dark:
+        return []
+
+    visited: set[tuple[int, int]] = set()
+    components: list[set[tuple[int, int]]] = []
+
+    for start in dark:
+        if start in visited:
+            continue
+        component: set[tuple[int, int]] = set()
+        queue = [start]
+        visited.add(start)
+        while queue:
+            x, y = queue.pop()
+            component.add((x, y))
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if (nx, ny) in dark and (nx, ny) not in visited:
+                    visited.add((nx, ny))
+                    queue.append((nx, ny))
+        components.append(component)
+
+    return sorted(components, key=len, reverse=True)
+
+
+def split_by_count(img: Image.Image, n: int) -> list[dict]:
+    """
+    Trova i n componenti connessi più grandi nell'intera immagine e restituisce
+    per ciascuno un'immagine quadrata centrata su sfondo bianco con padding.
+
+    Non assume celle di dimensione uniforme: funziona anche con griglie irregolari.
+    I dettagli interni al soggetto (es. occhi all'interno di una faccia bianca)
+    vengono preservati: si croppa l'intera bounding box e il BFS-dal-bordo
+    non raggiunge i pixel interni al soggetto.
+    """
+    rgb = img.convert("RGB")
+    total_w, total_h = img.size
+
+    components = _find_all_components(rgb)
+    subjects = components[:n]
+
+    images = []
+    for index, subject in enumerate(subjects):
+        min_x = min(x for x, _ in subject)
+        max_x = max(x for x, _ in subject)
+        min_y = min(y for _, y in subject)
+        max_y = max(y for _, y in subject)
+
+        left = max(0, min_x - CONTENT_PADDING)
+        top = max(0, min_y - CONTENT_PADDING)
+        right = min(total_w, max_x + CONTENT_PADDING + 1)
+        bottom = min(total_h, max_y + CONTENT_PADDING + 1)
+
+        cell = img.crop((left, top, right, bottom))
+
+        # Trasla il soggetto nelle coordinate locali della cella croppata
+        subject_local = {(x - left, y - top) for x, y in subject}
+
+        # Rimuovi rumore esterno preservando i dettagli interni al soggetto
+        cell_rgb = cell.convert("RGB")
+        noise = _external_noise(subject_local, cell_rgb)
+
+        cell_rgba = cell.convert("RGBA")
+        out_pix = cell_rgba.load()
+        for x, y in noise:
+            out_pix[x, y] = (255, 255, 255, 255)
+
+        # Quadratura e centramento su sfondo bianco
+        side = max(cell_rgba.width, cell_rgba.height)
+        square = Image.new("RGBA", (side, side), (255, 255, 255, 255))
+        ox = (side - cell_rgba.width) // 2
+        oy = (side - cell_rgba.height) // 2
+        square.paste(cell_rgba, (ox, oy), cell_rgba)
+
+        images.append({"base64": to_base64_png(square), "index": index})
+
+    return images
 
 
 def split(img: Image.Image, rows: int, cols: int) -> list[dict]:

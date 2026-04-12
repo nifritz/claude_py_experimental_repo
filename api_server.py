@@ -12,6 +12,7 @@ Endpoints:
     GET  /health              → health check
     POST /merge-pdfs          → merge uploaded PDFs into one
     POST /split-grid          → split a sprite sheet into individual cells (base64 PNG)
+    POST /split-grid-count    → same, but finds n largest connected components (robust to irregular grids)
     POST /approssima-colori   → riduce i colori di un'immagine alla palette hardcodata
 """
 
@@ -27,7 +28,7 @@ from PIL import Image
 from scripts.approssima_colori import approssima
 from scripts.approssima_colori import to_base64_png as approssima_to_base64
 from scripts.merge_pdfs import merge
-from scripts.split_grid import split
+from scripts.split_grid import split, split_by_count
 from scripts.test_hello import hello
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -47,6 +48,11 @@ class SplitGridRequest(BaseModel):
     image_url: str
     rows: int
     cols: int
+
+
+class SplitGridByCountRequest(BaseModel):
+    image_url: str
+    n: int
 
 
 class ApprossimaColoriRequest(BaseModel):
@@ -87,6 +93,38 @@ def split_grid(req: SplitGridRequest) -> dict:
 
     images = split(img, req.rows, req.cols)
     logging.info("split-grid: %dx%d → %d celle", req.rows, req.cols, len(images))
+    return {"images": images}
+
+
+@app.post("/split-grid-count")
+def split_grid_count(req: SplitGridByCountRequest) -> dict:
+    """
+    Divide una sprite sheet nei n soggetti principali trovati per componenti connessi.
+
+    Alternativa a /split-grid: non assume celle di dimensione uniforme, quindi è
+    robusto a griglie irregolari generate da AI.
+
+    Body JSON: {"image_url": "https://...", "n": 10}
+    Response : {"images": [{"base64": "...", "index": 0}, ...]}
+    """
+    if req.n <= 0:
+        raise HTTPException(status_code=400, detail="n deve essere > 0")
+    if req.n > 50:
+        raise HTTPException(status_code=400, detail="n deve essere <= 50")
+
+    try:
+        resp = http_requests.get(req.image_url, timeout=30)
+        resp.raise_for_status()
+    except http_requests.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Errore download immagine: {e}") from e
+
+    try:
+        img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Immagine non valida: {e}") from e
+
+    images = split_by_count(img, req.n)
+    logging.info("split-grid-count: n=%d → %d soggetti trovati", req.n, len(images))
     return {"images": images}
 
 
