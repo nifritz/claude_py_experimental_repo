@@ -14,6 +14,7 @@ Endpoints:
     POST /split-grid          → split a sprite sheet into individual cells (base64 PNG)
     POST /split-grid-count    → same, but finds n largest connected components (robust to irregular grids)
     POST /approssima-colori   → riduce i colori di un'immagine alla palette hardcodata
+    POST /reduce-image        → riduce il peso di un'immagine PNG sotto una soglia in MB
 """
 
 import io
@@ -28,6 +29,8 @@ from PIL import Image
 from scripts.approssima_colori import approssima
 from scripts.approssima_colori import to_base64_png as approssima_to_base64
 from scripts.merge_pdfs import merge
+from scripts.reduce_image import reduce as reduce_image
+from scripts.reduce_image import to_base64_png as reduce_to_base64
 from scripts.split_grid import split, split_by_count
 from scripts.test_hello import hello
 
@@ -58,6 +61,11 @@ class SplitGridByCountRequest(BaseModel):
 class ApprossimaColoriRequest(BaseModel):
     image_url: str
     n_colori: int = 4
+
+
+class ReduceImageRequest(BaseModel):
+    image_url: str
+    max_mb: int
 
 
 @app.post("/test-hello")
@@ -153,6 +161,43 @@ def approssima_colori(req: ApprossimaColoriRequest) -> dict:
     result = approssima(img, req.n_colori)
     logging.info("approssima-colori: %d colori richiesti", req.n_colori)
     return {"base64": approssima_to_base64(result)}
+
+
+@app.post("/reduce-image")
+def reduce_image_endpoint(req: ReduceImageRequest) -> dict:
+    """
+    Riduce il peso di un'immagine PNG sotto la soglia specificata in MB.
+
+    Body JSON: {"image_url": "https://...", "max_mb": 5}
+    Response : {"base64": "<png base64>"}
+
+    Se l'immagine è già sotto la soglia viene restituita invariata.
+    Strategia: compressione PNG massima, poi scala le dimensioni se necessario.
+    """
+    if req.max_mb < 1:
+        raise HTTPException(status_code=400, detail="max_mb deve essere >= 1")
+
+    try:
+        resp = http_requests.get(req.image_url, timeout=30)
+        resp.raise_for_status()
+    except http_requests.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Errore download immagine: {e}") from e
+
+    try:
+        img = Image.open(io.BytesIO(resp.content))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Immagine non valida: {e}") from e
+
+    original_bytes = len(resp.content)
+    result = reduce_image(img, req.max_mb)
+    result_b64 = reduce_to_base64(result)
+    logging.info(
+        "reduce-image: max=%d MB, prima=%d bytes, dopo≈%d bytes",
+        req.max_mb,
+        original_bytes,
+        len(result_b64) * 3 // 4,
+    )
+    return {"base64": result_b64}
 
 
 @app.get("/health")
