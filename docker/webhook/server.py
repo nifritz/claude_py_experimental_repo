@@ -63,9 +63,12 @@ async def deploy(
         out_pull = _run(["git", "pull"], cwd=REPO_PATH)
         log.info("git pull: %s", out_pull)
 
+        # COMPOSE_PATH deve essere il path HOST-side del compose file (es. /docker/automazioni)
+        # in modo che Docker registri lo stesso percorso usato dal pannello Hostinger.
+        compose_file = os.path.join(COMPOSE_PATH, "docker-compose.yml")
         out_compose = _run(
-            ["docker", "compose", "-p", "automazioni", "-f", "/compose/docker-compose.yml",
-             "up", "-d", "--build", *COMPOSE_SERVICES],
+            ["docker", "compose", "-p", "automazioni", "-f", compose_file,
+             "up", "-d", "--build", "--remove-orphans", *COMPOSE_SERVICES],
             cwd=COMPOSE_PATH,
         )
         log.info("docker compose: %s", out_compose)
