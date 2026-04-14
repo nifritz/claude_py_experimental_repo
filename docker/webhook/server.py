@@ -63,9 +63,20 @@ async def deploy(
         out_pull = _run(["git", "pull"], cwd=REPO_PATH)
         log.info("git pull: %s", out_pull)
 
+        # Rimuove eventuale stack zombie creato in passato senza -p (nome default: "compose").
+        # Se non esiste è un no-op; non tocca lo stack "automazioni".
+        try:
+            _run(
+                ["docker", "compose", "-f", "/compose/docker-compose.yml", "down"],
+                cwd=COMPOSE_PATH,
+            )
+            log.info("Stack zombie rimosso (se presente)")
+        except RuntimeError as cleanup_err:
+            log.warning("Cleanup stack zombie: %s", cleanup_err)
+
         out_compose = _run(
             ["docker", "compose", "-p", "automazioni", "-f", "/compose/docker-compose.yml",
-             "up", "-d", "--build", *COMPOSE_SERVICES],
+             "up", "-d", "--build", "--remove-orphans", *COMPOSE_SERVICES],
             cwd=COMPOSE_PATH,
         )
         log.info("docker compose: %s", out_compose)
