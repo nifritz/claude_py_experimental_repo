@@ -229,22 +229,7 @@ def split_by_count(img: Image.Image, n: int) -> list[dict]:
     total_w, total_h = img.size
 
     components = _find_all_components(rgb)
-
-    # Seleziona i soggetti per densità = pixel / (bbox_w * bbox_h).
-    # Le griglie connesse hanno bounding box enorme rispetto ai pixel → densità bassa.
-    # I personaggi sono compatti → densità alta.
-    def _density(comp: set[tuple[int, int]]) -> float:
-        xs = [x for x, _ in comp]
-        ys = [y for _, y in comp]
-        bbox_w = max(xs) - min(xs) + 1
-        bbox_h = max(ys) - min(ys) + 1
-        return len(comp) / (bbox_w * bbox_h)
-
-    # Pool = i primi (n + 10) per pixel count: esclude rumore minuto (puntini 1-2px
-    # che avrebbero densità=1.0 e scalzerebbero i personaggi reali).
-    # Tra questi, riordina per densità: la griglia connessa ha bbox enorme → densità bassa.
-    pool = components[: n + 10]
-    subjects = sorted(pool, key=_density, reverse=True)[:n]
+    subjects = components[:n]
 
     images = []
     for index, subject in enumerate(subjects):
