@@ -240,7 +240,11 @@ def split_by_count(img: Image.Image, n: int) -> list[dict]:
         bbox_h = max(ys) - min(ys) + 1
         return len(comp) / (bbox_w * bbox_h)
 
-    subjects = sorted(components, key=_density, reverse=True)[:n]
+    # Pool = i primi (n + 10) per pixel count: esclude rumore minuto (puntini 1-2px
+    # che avrebbero densità=1.0 e scalzerebbero i personaggi reali).
+    # Tra questi, riordina per densità: la griglia connessa ha bbox enorme → densità bassa.
+    pool = components[: n + 10]
+    subjects = sorted(pool, key=_density, reverse=True)[:n]
 
     images = []
     for index, subject in enumerate(subjects):
