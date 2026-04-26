@@ -15,10 +15,13 @@ Endpoints:
     POST /split-grid-count    → same, but finds n largest connected components (robust to irregular grids)
     POST /approssima-colori   → riduce i colori di un'immagine alla palette hardcodata
     POST /reduce-image        → riduce il peso di un'immagine PNG sotto una soglia in MB
+    POST /converti-in-svg     → vettorizza un PNG in SVG AMS-ready (Inkscape-ready)
 """
 
 import io
 import logging
+import os
+from urllib.parse import unquote, urlparse
 
 import requests as http_requests
 from fastapi import FastAPI, HTTPException, UploadFile
@@ -28,6 +31,7 @@ from PIL import Image
 
 from scripts.approssima_colori import approssima
 from scripts.approssima_colori import to_base64_png as approssima_to_base64
+from scripts.converti_in_svg import converti as converti_in_svg_fn
 from scripts.merge_pdfs import merge
 from scripts.reduce_image import reduce as reduce_image
 from scripts.reduce_image import to_base64_png as reduce_to_base64
@@ -66,6 +70,10 @@ class ApprossimaColoriRequest(BaseModel):
 class ReduceImageRequest(BaseModel):
     image_url: str
     max_mb: int
+
+
+class ConvertiInSvgRequest(BaseModel):
+    image_url: str
 
 
 @app.post("/test-hello")
@@ -198,6 +206,52 @@ def reduce_image_endpoint(req: ReduceImageRequest) -> dict:
         len(result_b64) * 3 // 4,
     )
     return {"base64": result_b64}
+
+
+def _svg_filename_from_url(url: str) -> str:
+    """Deriva il nome del file SVG dall'URL: basename → stem → '.svg'.
+
+    Sanitizza a [a-zA-Z0-9-_.] per essere safe in Content-Disposition.
+    Fallback a 'vettoriale.svg' se l'URL non contiene un nome utile.
+    """
+    raw = os.path.basename(unquote(urlparse(url).path))
+    stem, _ = os.path.splitext(raw)
+    safe = "".join(c for c in stem if c.isalnum() or c in "-_.")
+    return f"{safe}.svg" if safe else "vettoriale.svg"
+
+
+@app.post("/converti-in-svg")
+def converti_in_svg(req: ConvertiInSvgRequest) -> Response:
+    """
+    Vettorizza un PNG in un SVG AMS-ready (regioni colorate + lineart nero
+    + PNG originale embeddato).
+
+    Body JSON: {"image_url": "https://..."}
+    Response : SVG (image/svg+xml) — apre direttamente in Inkscape.
+                Filename derivato dall'URL con estensione .svg.
+
+    Funziona bene su immagini con regioni piatte e lineart nero netto.
+    Su immagini sfumate, fotografiche o con anti-aliasing forte i risultati
+    possono essere visivamente discutibili (regioni unite, lineart spezzettato).
+    """
+    try:
+        resp = http_requests.get(req.image_url, timeout=30)
+        resp.raise_for_status()
+    except http_requests.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Errore download immagine: {e}") from e
+
+    try:
+        svg = converti_in_svg_fn(resp.content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    filename = _svg_filename_from_url(req.image_url)
+    logging.info("converti-in-svg: SVG generato (%d caratteri) → %s", len(svg), filename)
+    return Response(
+        content=svg,
+        media_type="image/svg+xml",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/health")
