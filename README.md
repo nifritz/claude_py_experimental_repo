@@ -149,6 +149,19 @@ Swagger: `ssh -L 8000:localhost:8000 user@ip-vps` → `http://localhost:8000/doc
 → {"status": "ok"}
 ```
 
+### `POST /converti-in-svg`
+
+Vettorizza un PNG in un SVG AMS-ready (regioni colorate distinte + lineart
+nero geometrico + PNG originale embeddato). L'output è un file SVG standard
+che si apre direttamente in Inkscape.
+
+- **Request:** `application/json` → `{"image_url": "https://..."}`
+- **Response:** `image/svg+xml` (binario / testo XML)
+
+Funziona bene su immagini con regioni piatte e lineart nero netto. Su
+immagini sfumate o fotografiche i risultati possono essere visivamente
+discutibili.
+
 ### `POST /merge-pdfs`
 
 Unisce più file PDF in un unico PDF.

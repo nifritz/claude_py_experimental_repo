@@ -15,6 +15,10 @@ dependencies = [
     # split-grid
     "pillow>=10.0.0",
     "requests>=2.31.0",
+    # converti-in-svg (vettorizzazione AMS-ready)
+    "numpy>=1.26.0",
+    "opencv-python-headless>=4.9.0",
+    "potracer>=0.0.4",
 ]
 
 [project.optional-dependencies]
