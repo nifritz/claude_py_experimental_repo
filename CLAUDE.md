@@ -34,16 +34,22 @@ claude_py_experimental_repo/
 
 ## Git Workflow
 
-- **Main branch**: `main` — stable, reviewed code only
-- **Development branches**: `claude/<description>-<id>` for AI-driven work; feature branches for human-driven work
+- **Default**: lavora direttamente su `main`. Per lavoro nuovo (nuovo endpoint, nuovo script, nuova feature) committa e pusha su `main` senza creare branch e senza chiedere conferma.
 - **Commit signing**: Enabled via SSH key; commits are signed automatically
 - **Remote**: `http://local_proxy@127.0.0.1:37341/git/nifritz/claude_py_experimental_repo`
 
-### Branch conventions
+### Quando usare un branch (eccezione, non regola)
 
-- Always develop on the designated feature branch, never push directly to `main`
-- Branch names for Claude-initiated work follow the pattern `claude/<short-description>-<id>`
-- Push with: `git push -u origin <branch-name>`
+Crea un branch `claude/<short-description>-<id>` **solo** se il lavoro è rischioso, e in particolare quando:
+
+- Modifica/rifattorizza codice o endpoint **esistenti** che già funzionano (rischio di rompere consumi N8N in produzione)
+- Tocca infra di deploy o file critici (es. `docker/webhook/server.py` — vedi sotto)
+- È un cambiamento ampio/strutturale di cui non si è sicuri
+- L'utente lo chiede esplicitamente
+
+In questi casi: branch → push con `git push -u origin <branch-name>` → PR per review.
+
+Per tutto il resto (roba nuova, additiva, a basso rischio): direttamente su `main`.
 
 ## Python Conventions
 
@@ -94,7 +100,7 @@ uvicorn api_server:app --reload
 - Prefer editing existing files over creating new ones unless a new file is clearly needed
 - Do not add unnecessary abstractions — keep code simple and readable
 - Do not commit secrets, credentials, or `.env` files
-- Always work on the designated feature branch, not `main`
+- Default: lavora e pusha direttamente su `main` (vedi Git Workflow). Branch solo per lavoro rischioso o su codice esistente
 - When in doubt about scope, ask before making large structural changes
 - When adding a new script that requires new libraries, always update `pyproject.toml` accordingly
 
