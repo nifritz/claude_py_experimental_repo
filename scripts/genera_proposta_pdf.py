@@ -10,10 +10,23 @@ Nessun riferimento HTTP qui dentro (pattern del repo: logica pura in scripts/).
 from __future__ import annotations
 
 import os
+import re
 import secrets
 
 from jinja2 import Template
 from weasyprint import HTML
+
+# Emoji / pittogrammi che WeasyPrint (font DejaVu, no emoji a colori) renderizza
+# come tofu. Le rimuoviamo dai testi del PDF. NB: NON includiamo le frecce
+# (U+2190–21FF) perché usiamo "→" nella rotta.
+_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF"  # simboli & pittogrammi, emoticon, trasporti, supplementari
+    "\U00002600-\U000027BF"  # misc symbols + dingbats
+    "\U00002B00-\U00002BFF"  # frecce/stelle varie
+    "\U0000FE00-\U0000FE0F"  # variation selectors
+    "\U0000200D]",  # zero-width joiner
+    flags=re.UNICODE,
+)
 
 # Directory persistente (volume montato sul container python-utils) e base URL pubblico
 DATA_DIR = os.environ.get("PROPOSTE_DIR", "/app/data/proposte")
@@ -160,9 +173,11 @@ _TEMPLATE = Template(
 
 
 def _clean(value: object) -> str:
-    """Stringa safe per il template. Rimuove None e spazi; l'escape HTML dei valori
-    interpolati è gestito da jinja (autoescape=True)."""
-    return "" if value is None else str(value).strip()
+    """Stringa safe per il template. Rimuove None, emoji (tofu in WeasyPrint) e spazi
+    ai bordi; l'escape HTML dei valori interpolati è gestito da jinja (autoescape=True)."""
+    if value is None:
+        return ""
+    return _EMOJI_RE.sub("", str(value)).strip()
 
 
 def _build_context(p: dict) -> dict:
