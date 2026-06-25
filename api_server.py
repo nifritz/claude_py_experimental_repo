@@ -21,17 +21,20 @@ Endpoints:
 import io
 import logging
 import os
+import re
 from urllib.parse import unquote, urlparse
 
 import requests as http_requests
 from fastapi import FastAPI, HTTPException, UploadFile
 from pydantic import BaseModel
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from PIL import Image
 
 from scripts.approssima_colori import approssima
 from scripts.approssima_colori import to_base64_png as approssima_to_base64
 from scripts.converti_in_svg import converti as converti_in_svg_fn
+from scripts.genera_proposta_pdf import DATA_DIR as PROPOSTE_DIR
+from scripts.genera_proposta_pdf import genera_proposta_pdf
 from scripts.merge_pdfs import merge
 from scripts.reduce_image import reduce as reduce_image
 from scripts.reduce_image import to_base64_png as reduce_to_base64
@@ -49,6 +52,22 @@ app = FastAPI(
 
 class HelloRequest(BaseModel):
     name: str
+
+
+class PropostaPdfRequest(BaseModel):
+    """Dati della proposta di viaggio BellaRota (riepilogo scelte + output Sonnet)."""
+
+    nome: str = ""
+    taglio: str = ""
+    abertura: str = ""
+    month: str | None = None
+    travelers: int | None = None
+    totalDays: int | None = None
+    recap: list[dict] = []
+    teaser: dict = {}
+    route: list[dict] = []
+    idea_principal: dict = {}
+    alternativas: list[dict] = []
 
 
 class SplitGridRequest(BaseModel):
@@ -251,6 +270,52 @@ def converti_in_svg(req: ConvertiInSvgRequest) -> Response:
         content=svg,
         media_type="image/svg+xml",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/genera-proposta-pdf")
+def genera_proposta_pdf_endpoint(req: PropostaPdfRequest) -> dict:
+    """
+    Genera la proposta di viaggio BellaRota in PDF, la salva con un token casuale
+    non indovinabile e ritorna l'URL pubblico (servito da GET /p/{token}).
+
+    Body JSON: dati del lead (nome, recap, teaser, route, taglio, month, travelers,
+    totalDays) + output del modello Sonnet (abertura, idea_principal, alternativas).
+    Risposta: {"url": "https://bellarota.com/p/<token>", "token": "<token>"}.
+
+    Chiamato da N8N (rete Docker interna) nel workflow bellarota-lead.
+    """
+    try:
+        result = genera_proposta_pdf(req.model_dump())
+    except Exception as exc:  # noqa: BLE001 — degradiamo con 500, mai crash
+        logging.exception("genera-proposta-pdf fallito")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    logging.info("proposta PDF generata: token=%s", result.get("token"))
+    return result
+
+
+_PDF_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,}$")
+
+
+@app.get("/p/{token}")
+def serve_proposta_pdf(token: str) -> FileResponse:
+    """
+    Serve il PDF di una proposta dato il suo token (URL non indovinabile).
+
+    La segretezza è garantita dal token random (path non elencabile). Il token è
+    validato con regex per evitare path traversal. 404 se il token è malformato o
+    il file non esiste. Servito inline (si apre nel browser).
+    """
+    if not _PDF_TOKEN_RE.match(token):
+        raise HTTPException(status_code=404, detail="Não encontrado")
+    path = os.path.join(PROPOSTE_DIR, f"{token}.pdf")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Não encontrado")
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        filename="proposta-bellarota.pdf",
+        content_disposition_type="inline",
     )
 
 
