@@ -60,6 +60,7 @@ class PropostaPdfRequest(BaseModel):
     nome: str = ""
     taglio: str = ""
     abertura: str = ""
+    ajuste: str = ""
     month: str | None = None
     travelers: int | None = None
     totalDays: int | None = None

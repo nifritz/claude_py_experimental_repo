@@ -83,6 +83,9 @@ _TEMPLATE = Template(
   ul.inj { list-style: none; padding: 0; margin: 10pt 0 0; }
   ul.inj li { font-size: 10pt; color: {{ C.verde }}; margin: 0 0 4pt; }
   .dica { font-style: italic; color: {{ C.verde }}; margin: 10pt 0 0; }
+  .ajuste { background: {{ C.creme }}; border-left: 3pt solid {{ C.amarelo }}; padding: 8pt 11pt;
+            margin: 10pt 0 0; font-size: 10.5pt; color: {{ C.blu }}; border-radius: 0 6pt 6pt 0; }
+  .ajuste b { color: {{ C.laranja }}; }
   .sealed { color: {{ C.laranja }}; font-weight: bold; margin: 6pt 0 0; }
   .abertura { font-size: 12pt; line-height: 1.6; margin: 0 0 12pt; }
   .ideabox { background: {{ C.azul }}; color: {{ C.creme }}; border-radius: 12pt; padding: 16pt 18pt; margin: 0 0 14pt; }
@@ -122,6 +125,7 @@ _TEMPLATE = Template(
       {% if rota %}<p class="rota"><b>Sua rota:</b> {{ rota }}</p>{% endif %}
       <p class="chips">{% for c in chips %}<span class="chip"><b>{{ c.topic }}:</b> {{ c.value }}</span>{% endfor %}</p>
       {% if injections %}<ul class="inj">{% for i in injections %}<li>&#10003; {{ i }}</li>{% endfor %}</ul>{% endif %}
+      {% if ajuste %}<p class="ajuste"><b>Você pediu para ajustar:</b> {{ ajuste }}</p>{% endif %}
       {% if dica %}<p class="dica">{{ dica }}</p>{% endif %}
       {% if sealed %}<p class="sealed">{{ sealed }}</p>{% endif %}
     </div>
@@ -233,6 +237,7 @@ def _build_context(p: dict) -> dict:
         "rota": rota,
         "chips": chips,
         "injections": [_clean(i) for i in (teaser.get("injections") or []) if _clean(i)],
+        "ajuste": _clean(p.get("ajuste")),
         "dica": _clean(teaser.get("dicaSecreta")),
         "sealed": _clean(teaser.get("sealed")),
         "abertura": _clean(p.get("abertura")),
