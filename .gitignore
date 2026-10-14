@@ -205,3 +205,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Claude Code: permessi locali e worktree temporanei, mai su GitHub
+.claude/
