@@ -12,10 +12,8 @@ Ogni prodotto ha la sua cartella, col nome del suo handle: nessuna lista da tene
 
 from __future__ import annotations
 
-import hashlib
 import io
 import ipaddress
-import json
 import os
 import re
 import secrets
@@ -238,12 +236,13 @@ def salva_foto(
     filename: str | None,
     prodotto: str | None,
 ) -> dict:
-    """Salva i byte ORIGINALI (nessuna ricodifica) + sidecar .json.
+    """Salva i byte ORIGINALI (nessuna ricodifica), un file solo: data, codice e
+    prodotto stanno nel percorso, il nome originale nella riga dell'ordine.
 
     Ritorna {"codice", "nome", "byte"}. Solleva FotoError per input non validi.
     """
     cartella = valida_prodotto(prodotto)
-    formato, ext, larghezza, altezza = ispeziona_immagine(data)
+    _formato, ext, _larghezza, _altezza = ispeziona_immagine(data)
     controlla_spazio()
 
     ora = datetime.now(FUSO)
@@ -254,28 +253,15 @@ def salva_foto(
     with _lock:
         cartella_mese.mkdir(parents=True, exist_ok=True)
         codice = genera_codice(ora, cartella_mese)
-        base = f"{ora:%Y%m%d-%H%M}_{codice}_{nome_pulito}"
-        percorso_foto = cartella_mese / f"{base}.{ext}"
-        percorso_json = cartella_mese / f"{base}.json"
-        meta = {
-            "codice": codice,
-            "nome_originale": nome_originale,
-            "byte": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
-            "formato": formato,
-            "larghezza": larghezza,
-            "altezza": altezza,
-            "prodotto": cartella,
-            "caricato_il": ora.isoformat(timespec="seconds"),
-        }
-        try:
-            with open(percorso_foto, "xb") as f:
+        percorso_foto = (
+            cartella_mese / f"{ora:%Y%m%d-%H%M}_{codice}_{nome_pulito}.{ext}"
+        )
+        with open(percorso_foto, "xb") as f:  # "x": mai sovrascrivere
+            try:
                 f.write(data)
-            with open(percorso_json, "x", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
-        except Exception:
-            percorso_foto.unlink(missing_ok=True)
-            percorso_json.unlink(missing_ok=True)
-            raise
+            except Exception:
+                f.close()
+                percorso_foto.unlink(missing_ok=True)  # solo quello creato qui
+                raise
 
     return {"codice": codice, "nome": nome_originale, "byte": len(data)}

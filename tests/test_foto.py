@@ -2,7 +2,6 @@
 
 import hashlib
 import io
-import json
 import re
 from collections import namedtuple
 
@@ -75,25 +74,33 @@ def test_jpeg_valido_salvato_con_byte_identici(client, tmp_path):
     assert body["nome"] == nome
     assert body["byte"] == len(data)
 
-    jpgs = list(tmp_path.glob("ritratto-di-coppia/*/*.jpg"))
-    assert len(jpgs) == 1
+    # un file solo, niente sidecar: data, codice e prodotto stanno nel percorso
+    salvati = _file_salvati(tmp_path)
+    assert len(salvati) == 1
+    jpg = salvati[0]
+    assert jpg.parent.parent.name == "ritratto-di-coppia"
     sha = hashlib.sha256(data).hexdigest()
-    assert hashlib.sha256(jpgs[0].read_bytes()).hexdigest() == sha
+    assert hashlib.sha256(jpg.read_bytes()).hexdigest() == sha
     assert re.fullmatch(
-        rf"\d{{8}}-\d{{4}}_{body['codice']}_La-mia-foto-e-bella\.jpg", jpgs[0].name
+        rf"\d{{8}}-\d{{4}}_{body['codice']}_La-mia-foto-e-bella\.jpg", jpg.name
     )
 
-    meta = json.loads(jpgs[0].with_suffix(".json").read_text(encoding="utf-8"))
-    assert meta["codice"] == body["codice"]
-    assert meta["nome_originale"] == nome
-    assert meta["byte"] == len(data)
-    assert meta["sha256"] == sha
-    assert meta["formato"] == "JPEG"
-    assert (meta["larghezza"], meta["altezza"]) == (64, 48)
-    assert meta["prodotto"] == "ritratto-di-coppia"
-    assert re.fullmatch(
-        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+0[12]:00", meta["caricato_il"]
+
+def test_file_esistente_mai_sovrascritto_ne_cancellato(tmp_path, monkeypatch):
+    ora = foto_clienti.datetime.now(foto_clienti.FUSO)
+    mese = tmp_path / "ritratto-da-foto-in-rilievo" / f"{ora:%Y-%m}"
+    mese.mkdir(parents=True)
+    altrui = mese / f"{ora:%Y%m%d-%H%M}_F-0101-AAAAA_foto.jpg"
+    altrui.write_bytes(b"foto di un altro cliente")
+    monkeypatch.setattr(foto_clienti, "genera_codice", lambda *_: "F-0101-AAAAA")
+    monkeypatch.setattr(
+        foto_clienti, "datetime", type("D", (), {"now": lambda _tz: ora})
     )
+    with pytest.raises(FileExistsError):
+        foto_clienti.salva_foto(
+            _immagine("JPEG"), "foto.jpg", "ritratto-da-foto-in-rilievo"
+        )
+    assert altrui.read_bytes() == b"foto di un altro cliente"
 
 
 def test_ogni_prodotto_ha_la_sua_cartella(client, tmp_path):
@@ -150,7 +157,7 @@ def test_limite_esatto(client, tmp_path, monkeypatch):
     assert _post(client, data).status_code == 200
     monkeypatch.setattr(foto_clienti, "MAX_BYTES", len(data) - 1)
     assert _post(client, data).status_code == 413
-    assert len(_file_salvati(tmp_path)) == 2  # solo foto+json del primo upload
+    assert len(_file_salvati(tmp_path)) == 1  # solo la foto del primo upload
 
 
 # 4) Contenuto non immagine --------------------------------------------------- #
