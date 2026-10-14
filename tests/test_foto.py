@@ -17,7 +17,7 @@ from scripts import foto_clienti
 register_heif_opener()
 
 ORIGINE_OK = "https://bimbiunici.it"
-CODICE_RE = re.compile(r"^[RBD]-\d{4}-[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{5}$")
+CODICE_RE = re.compile(r"^F-\d{4}-[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{5}$")
 GB = 1024**3
 DiskUsage = namedtuple("DiskUsage", "total used free")
 
@@ -45,15 +45,15 @@ def client():
     return TestClient(app)
 
 
-def _post(client, data: bytes, nome="foto.jpg", cartella="ritratti", **extra):
-    form = {"cartella": cartella, **extra}
+def _post(client, data: bytes, nome="foto.jpg", prodotto="ritratto-da-foto-in-rilievo"):
+    form = {"prodotto": prodotto}
     return client.post("/foto", data=form, files={"file": (nome, data, "image/jpeg")})
 
 
 def _post_xff(client, data: bytes, xff: str):
     return client.post(
         "/foto",
-        data={"cartella": "ritratti"},
+        data={"prodotto": "ritratto-da-foto-in-rilievo"},
         files={"file": ("a.jpg", data, "image/jpeg")},
         headers={"X-Forwarded-For": xff},
     )
@@ -71,11 +71,11 @@ def test_jpeg_valido_salvato_con_byte_identici(client, tmp_path):
     assert r.status_code == 200
     body = r.json()
     assert CODICE_RE.match(body["codice"])
-    assert body["codice"].startswith("R-")
+    assert body["codice"].startswith("F-")
     assert body["nome"] == nome
     assert body["byte"] == len(data)
 
-    jpgs = list(tmp_path.glob("ritratti/*/*.jpg"))
+    jpgs = list(tmp_path.glob("ritratto-di-coppia/*/*.jpg"))
     assert len(jpgs) == 1
     sha = hashlib.sha256(data).hexdigest()
     assert hashlib.sha256(jpgs[0].read_bytes()).hexdigest() == sha
@@ -90,28 +90,33 @@ def test_jpeg_valido_salvato_con_byte_identici(client, tmp_path):
     assert meta["sha256"] == sha
     assert meta["formato"] == "JPEG"
     assert (meta["larghezza"], meta["altezza"]) == (64, 48)
-    assert meta["cartella"] == "ritratti"
     assert meta["prodotto"] == "ritratto-di-coppia"
     assert re.fullmatch(
         r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+0[12]:00", meta["caricato_il"]
     )
 
 
-def test_prodotto_non_valido_salvato_vuoto(client, tmp_path):
-    r = _post(client, _immagine("JPEG"), prodotto="../Evil Handle")
-    assert r.status_code == 200
-    percorso_json = next(tmp_path.glob("ritratti/*/*.json"))
-    meta = json.loads(percorso_json.read_text(encoding="utf-8"))
-    assert meta["prodotto"] == ""
+def test_ogni_prodotto_ha_la_sua_cartella(client, tmp_path):
+    assert (
+        _post(client, _immagine("JPEG"), prodotto="portafoto-battesimo").status_code
+        == 200
+    )
+    assert (
+        _post(client, _immagine("JPEG"), prodotto="disegno-dei-nonni").status_code
+        == 200
+    )
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "disegno-dei-nonni",
+        "portafoto-battesimo",
+    ]
 
 
 # 2) HEIC ------------------------------------------------------------------- #
 def test_heic_valido_estensione_heic(client, tmp_path):
     data = _immagine("HEIF")
-    r = _post(client, data, nome="IMG_0001.HEIC", cartella="battesimi")
+    r = _post(client, data, nome="IMG_0001.HEIC")
     assert r.status_code == 200
-    assert r.json()["codice"].startswith("B-")
-    salvati = list(tmp_path.glob("battesimi/*/*.heic"))
+    salvati = list(tmp_path.glob("ritratto-da-foto-in-rilievo/*/*.heic"))
     assert len(salvati) == 1
     assert salvati[0].read_bytes() == data
 
@@ -126,9 +131,9 @@ def test_heic_valido_estensione_heic(client, tmp_path):
 )
 def test_altri_formati_ammessi(client, tmp_path, formato, ext, kw):
     # Il nome inviato mente (.txt): conta solo il contenuto.
-    r = _post(client, _immagine(formato, **kw), nome="x.txt", cartella="disegni")
+    r = _post(client, _immagine(formato, **kw), nome="x.txt")
     assert r.status_code == 200
-    assert len(list(tmp_path.glob(f"disegni/*/*.{ext}"))) == 1
+    assert len(list(tmp_path.glob(f"ritratto-da-foto-in-rilievo/*/*.{ext}"))) == 1
 
 
 # 3) File troppo grande ------------------------------------------------------ #
@@ -164,18 +169,36 @@ def test_formato_immagine_non_ammesso_415(client):
     assert _post(client, _immagine("BMP"), nome="a.bmp").status_code == 415
 
 
-# 5) Cartella ---------------------------------------------------------------- #
+# 5) Prodotto = cartella: niente che esca da FOTO_DIR ------------------------- #
 @pytest.mark.parametrize(
-    "cartella", ["altro", "../ritratti", "", "RITRATTI", "ritratti/.."]
+    "prodotto",
+    [
+        "..",
+        "../ritratti",
+        "",
+        "Ritratto",
+        "ritratto/..",
+        "a.b",
+        "-x",
+        "a b",
+        "x" * 81,
+        "/etc",
+    ],
 )
-def test_cartella_non_in_lista_400(client, tmp_path, cartella):
-    r = _post(client, _immagine("JPEG"), cartella=cartella)
+def test_prodotto_non_valido_400(client, tmp_path, prodotto):
+    r = _post(client, _immagine("JPEG"), prodotto=prodotto)
     assert r.status_code in (400, 422)  # "" è rifiutato già come campo mancante
     assert _file_salvati(tmp_path) == []
 
 
-def test_cartella_sconosciuta_e_esattamente_400(client):
-    assert _post(client, _immagine("JPEG"), cartella="altro").status_code == 400
+def test_prodotto_mancante_422(client, tmp_path):
+    r = client.post("/foto", files={"file": ("a.jpg", _immagine("JPEG"), "image/jpeg")})
+    assert r.status_code == 422
+    assert _file_salvati(tmp_path) == []
+
+
+def test_prodotto_non_valido_e_esattamente_400(client):
+    assert _post(client, _immagine("JPEG"), prodotto="../x").status_code == 400
 
 
 # 6) CORS -------------------------------------------------------------------- #
@@ -203,7 +226,7 @@ def test_errori_portano_header_cors(client):
     # Il JS del tema deve poter leggere anche 400/415/429.
     r = client.post(
         "/foto",
-        data={"cartella": "x"},
+        data={"prodotto": "../x"},
         files={"file": ("a.jpg", b"1", "image/jpeg")},
         headers={"Origin": ORIGINE_OK},
     )
@@ -255,7 +278,7 @@ def test_200_codici_unici_e_alfabeto(tmp_path):
     ora = foto_clienti.datetime.now(foto_clienti.FUSO)
     codici = set()
     for _ in range(200):
-        codice = foto_clienti.genera_codice("R", ora, tmp_path)
+        codice = foto_clienti.genera_codice(ora, tmp_path)
         assert CODICE_RE.match(codice)
         assert codice[2:6] == f"{ora:%m%d}"
         assert not set(codice[7:]) & set("01OIL")
@@ -266,18 +289,21 @@ def test_200_codici_unici_e_alfabeto(tmp_path):
 
 def test_codice_gia_esistente_viene_rigenerato(tmp_path, monkeypatch):
     ora = foto_clienti.datetime.now(foto_clienti.FUSO)
-    (tmp_path / "20260101-1200_R-0101-AAAAA_foto.jpg").touch()
-    sequenza = iter(["R-0101-AAAAA", "R-0101-BBBBB"])
+    (tmp_path / "20260101-1200_F-0101-AAAAA_foto.jpg").touch()
+    sequenza = iter(["F-0101-AAAAA", "F-0101-BBBBB"])
     monkeypatch.setattr(foto_clienti, "_codice_casuale", lambda *_: next(sequenza))
-    assert foto_clienti.genera_codice("R", ora, tmp_path) == "R-0101-BBBBB"
+    assert foto_clienti.genera_codice(ora, tmp_path) == "F-0101-BBBBB"
 
 
 # 9) Cartella del mese -------------------------------------------------------- #
 def test_cartella_del_mese_creata_da_sola(client, tmp_path):
     assert list(tmp_path.iterdir()) == []
-    assert _post(client, _immagine("JPEG"), cartella="disegni").status_code == 200
+    assert (
+        _post(client, _immagine("JPEG"), prodotto="disegno-dei-nonni").status_code
+        == 200
+    )
     ora = foto_clienti.datetime.now(foto_clienti.FUSO)
-    assert (tmp_path / "disegni" / f"{ora:%Y-%m}").is_dir()
+    assert (tmp_path / "disegno-dei-nonni" / f"{ora:%Y-%m}").is_dir()
 
 
 # 10) X-Forwarded-For ---------------------------------------------------------- #
@@ -341,7 +367,7 @@ def test_filename_malevolo_non_esce_dalla_cartella(client, tmp_path):
     salvati = _file_salvati(tmp_path)
     assert salvati
     for p in salvati:
-        assert p.relative_to(tmp_path).parts[0] == "ritratti"
+        assert p.relative_to(tmp_path).parts[0] == "ritratto-da-foto-in-rilievo"
 
 
 def test_nessun_get_su_foto(client):

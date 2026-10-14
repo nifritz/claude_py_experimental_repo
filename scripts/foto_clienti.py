@@ -6,7 +6,8 @@ generazione del codice e salvataggio su disco. Nessun riferimento HTTP: gli
 errori sono eccezioni `FotoError` che `api_server.py` traduce in status code.
 
 Il servizio è esposto su internet: i percorsi si costruiscono SOLO da valori
-validati (cartella dalla lista, codice generato qui, nome ripulito).
+validati (handle del prodotto controllato, codice generato qui, nome ripulito).
+Ogni prodotto ha la sua cartella, col nome del suo handle: nessuna lista da tenere.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ MAX_BYTES = 26_214_400  # 25 MB
 CHUNK_BYTES = 1024 * 1024
 MIN_FREE_BYTES = 10 * 1024**3  # sotto i 10 GB liberi non si salva più
 
-CARTELLE = {"ritratti": "R", "battesimi": "B", "disegni": "D"}
+LETTERA_CODICE = "F"
 
 # Formato Pillow -> estensione (si decide dal contenuto, mai dal nome inviato).
 FORMATI = {"JPEG": "jpg", "MPO": "jpg", "PNG": "png", "HEIF": "heic", "WEBP": "webp"}
@@ -49,7 +50,9 @@ RATE_TOTALE_GIORNO = 200
 PROXY_SUBNET = ipaddress.ip_network("172.18.0.0/16")
 
 FUSO = ZoneInfo("Europe/Rome")
-_PRODOTTO_RE = re.compile(r"[a-z0-9-]{1,100}")
+_PRODOTTO_RE = re.compile(
+    r"[a-z0-9][a-z0-9-]{0,79}"
+)  # handle Shopify: niente punti né barre
 _NOME_MAX = 40
 _NOME_ORIGINALE_MAX = 255
 
@@ -66,8 +69,8 @@ class FotoError(Exception):
         self.detail = detail
 
 
-class CartellaNonValida(FotoError):
-    kind = "cartella"
+class ProdottoNonValido(FotoError):
+    kind = "prodotto"
 
 
 class FileTroppoGrande(FotoError):
@@ -168,19 +171,11 @@ def ip_cliente(client_host: str | None, x_forwarded_for: str | None) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def valida_cartella(cartella: str) -> str:
-    """Ritorna la lettera del codice; solleva CartellaNonValida se non in lista."""
-    lettera = CARTELLE.get(cartella)
-    if lettera is None:
-        raise CartellaNonValida("Cartella non valida")
-    return lettera
-
-
-def pulisci_prodotto(prodotto: str | None) -> str:
-    """Handle Shopify valido ([a-z0-9-], max 100) oppure stringa vuota."""
-    if prodotto and _PRODOTTO_RE.fullmatch(prodotto):
-        return prodotto
-    return ""
+def valida_prodotto(prodotto: str | None) -> str:
+    """Handle Shopify ([a-z0-9-], max 80) = nome della cartella, o ProdottoNonValido."""
+    if not prodotto or not _PRODOTTO_RE.fullmatch(prodotto):
+        raise ProdottoNonValido("Prodotto non valido")
+    return prodotto
 
 
 def pulisci_nome(filename: str | None) -> str:
@@ -225,15 +220,15 @@ def ispeziona_immagine(data: bytes) -> tuple[str, str, int, int]:
 # --------------------------------------------------------------------------- #
 
 
-def _codice_casuale(lettera: str, ora: datetime) -> str:
+def _codice_casuale(ora: datetime) -> str:
     suffisso = "".join(secrets.choice(ALFABETO_CODICE) for _ in range(LUNGHEZZA_CODICE))
-    return f"{lettera}-{ora:%m%d}-{suffisso}"
+    return f"{LETTERA_CODICE}-{ora:%m%d}-{suffisso}"
 
 
-def genera_codice(lettera: str, ora: datetime, cartella_mese: Path) -> str:
-    """Codice '<LETTERA>-<MMGG>-<5 caratteri>', rigenerato se già usato nel mese."""
+def genera_codice(ora: datetime, cartella_mese: Path) -> str:
+    """Codice 'F-<MMGG>-<5 caratteri>', rigenerato se già usato nel mese."""
     while True:
-        codice = _codice_casuale(lettera, ora)
+        codice = _codice_casuale(ora)
         if not cartella_mese.is_dir() or not any(cartella_mese.glob(f"*_{codice}_*")):
             return codice
 
@@ -241,14 +236,13 @@ def genera_codice(lettera: str, ora: datetime, cartella_mese: Path) -> str:
 def salva_foto(
     data: bytes,
     filename: str | None,
-    cartella: str,
-    prodotto: str | None = None,
+    prodotto: str | None,
 ) -> dict:
     """Salva i byte ORIGINALI (nessuna ricodifica) + sidecar .json.
 
     Ritorna {"codice", "nome", "byte"}. Solleva FotoError per input non validi.
     """
-    lettera = valida_cartella(cartella)
+    cartella = valida_prodotto(prodotto)
     formato, ext, larghezza, altezza = ispeziona_immagine(data)
     controlla_spazio()
 
@@ -259,7 +253,7 @@ def salva_foto(
 
     with _lock:
         cartella_mese.mkdir(parents=True, exist_ok=True)
-        codice = genera_codice(lettera, ora, cartella_mese)
+        codice = genera_codice(ora, cartella_mese)
         base = f"{ora:%Y%m%d-%H%M}_{codice}_{nome_pulito}"
         percorso_foto = cartella_mese / f"{base}.{ext}"
         percorso_json = cartella_mese / f"{base}.json"
@@ -271,8 +265,7 @@ def salva_foto(
             "formato": formato,
             "larghezza": larghezza,
             "altezza": altezza,
-            "cartella": cartella,
-            "prodotto": pulisci_prodotto(prodotto),
+            "prodotto": cartella,
             "caricato_il": ora.isoformat(timespec="seconds"),
         }
         try:

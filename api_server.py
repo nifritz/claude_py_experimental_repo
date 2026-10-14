@@ -341,7 +341,7 @@ def serve_proposta_pdf(token: str) -> FileResponse:
 
 
 _FOTO_STATUS = {
-    foto_clienti.CartellaNonValida: 400,
+    foto_clienti.ProdottoNonValido: 400,
     foto_clienti.FileTroppoGrande: 413,
     foto_clienti.FormatoNonSupportato: 415,
     foto_clienti.TroppeRichieste: 429,
@@ -353,15 +353,14 @@ _FOTO_STATUS = {
 async def carica_foto(
     request: Request,
     file: UploadFile,
-    cartella: str = Form(...),
-    prodotto: str | None = Form(None),
+    prodotto: str = Form(...),
 ) -> dict:
     """
     Riceve la foto originale di un cliente (dal browser, pagina prodotto Shopify),
     la salva su disco senza ricodificarla e ritorna un codice breve.
 
-    multipart/form-data: file, cartella (ritratti|battesimi|disegni), prodotto (opz.).
-    Risposta: {"codice": "R-0714-K7M2X", "nome": "<nome originale>", "byte": 123456}.
+    multipart/form-data: file, prodotto (handle Shopify = nome della cartella).
+    Risposta: {"codice": "F-0714-K7M2X", "nome": "<nome originale>", "byte": 123456}.
 
     Esposto su internet: rate limit, CORS ristretto, controllo del contenuto e dello
     spazio disco. NON esiste (e non va aggiunto) nessun GET che serva questi file.
@@ -373,7 +372,7 @@ async def carica_foto(
         )
         if not foto_clienti.limiter.consenti(ip):
             raise foto_clienti.TroppeRichieste("Troppe richieste, riprova più tardi")
-        foto_clienti.valida_cartella(cartella)
+        foto_clienti.valida_prodotto(prodotto)
 
         blocchi: list[bytes] = []
         totale = 0
@@ -389,7 +388,6 @@ async def carica_foto(
             foto_clienti.salva_foto,
             b"".join(blocchi),
             file.filename,
-            cartella,
             prodotto,
         )
     except foto_clienti.FotoError as exc:
