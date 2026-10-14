@@ -186,6 +186,50 @@ Unisce più file PDF in un unico PDF.
 [Google Drive] Upload risultato in destination folder
 ```
 
+### `POST /foto`
+
+Riceve la foto originale di un cliente (anche HEIC dell'iPhone, fino a 25 MB)
+direttamente dal browser, la salva su disco **senza ricodificarla** e ritorna un
+codice breve da riportare nell'ordine. Il servizio **non serve mai file in
+lettura**: non esiste nessun `GET` che legga le foto salvate.
+
+- **Request:** `multipart/form-data`
+  - `file` (obbligatorio) — la foto
+  - `cartella` (obbligatorio) — `ritratti` (codice `R-…`), `battesimi` (`B-…`) o `disegni` (`D-…`)
+  - `prodotto` (facoltativo) — handle Shopify, max 100 caratteri, solo `[a-z0-9-]`; se non valido viene scartato e salvato vuoto
+- **Response 200:** `{"codice": "R-0714-K7M2X", "nome": "<nome originale>", "byte": 123456}`
+- **Errori** (`{"detail": "<messaggio breve>"}`):
+
+| Status | Quando |
+|---|---|
+| 400 | `cartella` non nella lista |
+| 413 | file oltre 25 MB (non resta nulla su disco) |
+| 415 | il contenuto non è JPEG / MPO / PNG / HEIC / WEBP (si guarda il contenuto, non il nome) |
+| 429 | rate limit superato |
+| 507 | spazio libero su disco sotto 10 GB |
+
+**Salvataggio.** Sotto la cartella indicata da `FOTO_DIR` (default `/app/caricati`):
+`<cartella>/<AAAA-MM>/<AAAAMMGG-HHMM>_<CODICE>_<nome-pulito>.<ext>` più un file
+`.json` omonimo (`codice`, `nome_originale`, `byte`, `sha256`, `formato`,
+`larghezza`, `altezza`, `cartella`, `prodotto`, `caricato_il`). Data e ora sono in
+fuso Europe/Rome; l'estensione deriva dal formato reale. Il codice è
+`<LETTERA>-<MMGG>-<5 caratteri>` con alfabeto senza caratteri ambigui (niente
+`0 O 1 I L`), generato con `secrets` e rigenerato se già usato nel mese.
+
+**Difese** (il servizio è esposto su internet):
+- **CORS** ristretto ai soli domini del negozio, metodi `POST`/`OPTIONS`, senza
+  credenziali. Le chiamate server-to-server (senza `Origin`) non cambiano.
+- **Rate limit** in memoria: 10 richieste/ora per IP e 200/giorno in totale
+  (429 oltre). L'IP è quello della connessione; `X-Forwarded-For` (primo valore)
+  è considerato solo se la connessione arriva dalla subnet del reverse proxy.
+- **Contenuto verificato** con Pillow/pillow-heif senza decodificare i pixel;
+  lettura a blocchi con limite di dimensione.
+- **Percorsi** costruiti solo da valori validati: cartella da lista chiusa, codice
+  generato dal servizio, nome originale ripulito (`[A-Za-z0-9-]`, max 40).
+- **Spazio disco** controllato prima di ogni salvataggio.
+
+Test: `pytest tests/test_foto.py`.
+
 ---
 
 ## Claude Code (MCP)

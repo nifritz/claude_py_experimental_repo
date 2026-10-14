@@ -103,6 +103,7 @@ uvicorn api_server:app --reload
 - Default: lavora e pusha direttamente su `main` (vedi Git Workflow). Branch solo per lavoro rischioso o su codice esistente
 - When in doubt about scope, ask before making large structural changes
 - When adding a new script that requires new libraries, always update `pyproject.toml` accordingly
+- POST /foto (foto dei clienti Bimbi Unici) è esposto su internet: non si modifica senza rifare tests/test_foto.py, e non si aggiungono endpoint GET che leggano FOTO_DIR.
 
 ### MCP servers
 La cartella `mcp_servers/` contiene uno scheletro MCP completato ma **non attualmente utilizzato**. Non sviluppare ulteriormente questa parte salvo indicazione esplicita.

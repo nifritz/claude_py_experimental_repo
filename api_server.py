@@ -16,6 +16,7 @@ Endpoints:
     POST /approssima-colori   → riduce i colori di un'immagine alla palette hardcodata
     POST /reduce-image        → riduce il peso di un'immagine PNG sotto una soglia in MB
     POST /converti-in-svg     → vettorizza un PNG in SVG AMS-ready (Inkscape-ready)
+    POST /foto                → salva foto cliente Bimbi Unici, ritorna un codice
 """
 
 import io
@@ -25,11 +26,14 @@ import re
 from urllib.parse import unquote, urlparse
 
 import requests as http_requests
-from fastapi import FastAPI, HTTPException, UploadFile
-from pydantic import BaseModel
+from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from PIL import Image
+from pydantic import BaseModel
 
+from scripts import foto_clienti
 from scripts.approssima_colori import approssima
 from scripts.approssima_colori import to_base64_png as approssima_to_base64
 from scripts.converti_in_svg import converti as converti_in_svg_fn
@@ -47,6 +51,22 @@ app = FastAPI(
     title="Python Utils API",
     description="Utility API per N8N — espone script Python come endpoint REST.",
     version="0.2.0",
+)
+
+# CORS: serve solo a POST /foto (chiamata dal browser dei clienti). Le chiamate
+# server-to-server di n8n non hanno header Origin e non sono toccate.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://bimbiunici.it",
+        "https://www.bimbiunici.it",
+        "https://78ggra-ii.myshopify.com",
+        "https://bimbiunici.de",
+        "https://www.bimbiunici.de",
+    ],
+    allow_methods=["POST", "OPTIONS"],
+    allow_headers=["*"],
+    allow_credentials=False,
 )
 
 
@@ -318,6 +338,65 @@ def serve_proposta_pdf(token: str) -> FileResponse:
         filename="proposta-bellarota.pdf",
         content_disposition_type="inline",
     )
+
+
+_FOTO_STATUS = {
+    foto_clienti.CartellaNonValida: 400,
+    foto_clienti.FileTroppoGrande: 413,
+    foto_clienti.FormatoNonSupportato: 415,
+    foto_clienti.TroppeRichieste: 429,
+    foto_clienti.DiscoPieno: 507,
+}
+
+
+@app.post("/foto")
+async def carica_foto(
+    request: Request,
+    file: UploadFile,
+    cartella: str = Form(...),
+    prodotto: str | None = Form(None),
+) -> dict:
+    """
+    Riceve la foto originale di un cliente (dal browser, pagina prodotto Shopify),
+    la salva su disco senza ricodificarla e ritorna un codice breve.
+
+    multipart/form-data: file, cartella (ritratti|battesimi|disegni), prodotto (opz.).
+    Risposta: {"codice": "R-0714-K7M2X", "nome": "<nome originale>", "byte": 123456}.
+
+    Esposto su internet: rate limit, CORS ristretto, controllo del contenuto e dello
+    spazio disco. NON esiste (e non va aggiunto) nessun GET che serva questi file.
+    """
+    try:
+        ip = foto_clienti.ip_cliente(
+            request.client.host if request.client else None,
+            request.headers.get("x-forwarded-for"),
+        )
+        if not foto_clienti.limiter.consenti(ip):
+            raise foto_clienti.TroppeRichieste("Troppe richieste, riprova più tardi")
+        foto_clienti.valida_cartella(cartella)
+
+        blocchi: list[bytes] = []
+        totale = 0
+        while chunk := await file.read(foto_clienti.CHUNK_BYTES):
+            totale += len(chunk)
+            if totale > foto_clienti.MAX_BYTES:
+                raise foto_clienti.FileTroppoGrande("File troppo grande (max 25 MB)")
+            blocchi.append(chunk)
+        if not totale:
+            raise foto_clienti.FormatoNonSupportato("File vuoto")
+
+        result = await run_in_threadpool(
+            foto_clienti.salva_foto,
+            b"".join(blocchi),
+            file.filename,
+            cartella,
+            prodotto,
+        )
+    except foto_clienti.FotoError as exc:
+        status = _FOTO_STATUS[type(exc)]
+        raise HTTPException(status_code=status, detail=exc.detail) from exc
+    logging.info("foto salvata: codice=%s byte=%d", result["codice"], totale)
+    return result
 
 
 @app.get("/health")
