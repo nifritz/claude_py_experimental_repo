@@ -186,46 +186,74 @@ Unisce più file PDF in un unico PDF.
 [Google Drive] Upload risultato in destination folder
 ```
 
-### `POST /foto`
+### `POST /foto` e `POST /foto/elimina`
 
-Riceve la foto originale di un cliente (anche HEIC dell'iPhone, fino a 25 MB)
-direttamente dal browser, la salva su disco **senza ricodificarla** e ritorna un
-codice breve da riportare nell'ordine. Il servizio **non serve mai file in
-lettura**: non esiste nessun `GET` che legga le foto salvate.
+Ricevono le foto originali di un cliente (anche HEIC dell'iPhone, fino a 25 MB)
+direttamente dal browser, le salvano su disco **senza ricodificarle** e ritornano
+un codice breve da riportare nell'ordine: **un codice per carrello**, con dentro
+fino a **6 foto** che il cliente può cancellare e sostituire. Il servizio **non
+serve mai file in lettura**: non esiste nessun `GET` che legga le foto salvate.
 
-- **Request:** `multipart/form-data`
-  - `file` (obbligatorio) — la foto
-  - `cartella` (obbligatorio) — `ritratti` (codice `R-…`), `battesimi` (`B-…`) o `disegni` (`D-…`)
-  - `prodotto` (facoltativo) — handle Shopify, max 100 caratteri, solo `[a-z0-9-]`; se non valido viene scartato e salvato vuoto
-- **Response 200:** `{"codice": "R-0714-K7M2X", "nome": "<nome originale>", "byte": 123456}`
-- **Errori** (`{"detail": "<messaggio breve>"}`):
+**`POST /foto`** — `multipart/form-data`
+- `file` (obbligatorio) — la foto
+- `prodotto` (obbligatorio) — handle Shopify (`[a-z0-9-]`, max 80) = nome della cartella
+- `sessione`, `chiave` (facoltativi) — `codice` e `chiave` ricevuti dal primo caricamento
+- Senza `sessione`: nuovo codice, foto n. 1. Con `sessione` + `chiave`: foto
+  successiva nella stessa cartella (anche se aperta il mese prima).
+- **Response 200:** `{"codice": "F-1016-7K3QX", "numero": 2, "chiave": "<32 hex>", "nome": "<nome originale>", "byte": 123456}`
+  (`chiave` è `null` se `FOTO_SEGRETO` non è configurato: il caricamento singolo
+  funziona lo stesso, aggiungere e cancellare no).
+
+**`POST /foto/elimina`** — form: `prodotto`, `sessione`, `chiave`, `numero` (1..99)
+- Cancella solo il file con quel numero nella cartella della sessione, sotto quel
+  prodotto. La cartella resta, anche vuota. I numeri non si riusano finché c'è una
+  foto con numero più alto (es. cancellata la 2 di {1,2,3}, la prossima è la 4).
+- **Response 200:** `{"codice": "F-1016-7K3QX", "numero": 2, "eliminata": true}`
+
+**Errori** (`{"detail": "<messaggio breve>"}`):
 
 | Status | Quando |
 |---|---|
-| 400 | `cartella` non nella lista |
+| 400 | `prodotto`, `sessione` o `numero` non validi |
+| 403 | `chiave` sbagliata per quella `sessione` |
+| 404 | (elimina) nessuna foto con quel numero per la sessione |
+| 409 | già 6 foto nella cartella |
 | 413 | file oltre 25 MB (non resta nulla su disco) |
 | 415 | il contenuto non è JPEG / MPO / PNG / HEIC / WEBP (si guarda il contenuto, non il nome) |
+| 422 | campo obbligatorio mancante o `numero` non intero / fuori 1..99 |
 | 429 | rate limit superato |
+| 503 | `FOTO_SEGRETO` assente o sotto i 32 caratteri (solo per sessione e cancellazione) |
 | 507 | spazio libero su disco sotto 10 GB |
 
 **Salvataggio.** Sotto la cartella indicata da `FOTO_DIR` (default `/app/caricati`):
-`<cartella>/<AAAA-MM>/<AAAAMMGG-HHMM>_<CODICE>_<nome-pulito>.<ext>` più un file
-`.json` omonimo (`codice`, `nome_originale`, `byte`, `sha256`, `formato`,
-`larghezza`, `altezza`, `cartella`, `prodotto`, `caricato_il`). Data e ora sono in
-fuso Europe/Rome; l'estensione deriva dal formato reale. Il codice è
-`<LETTERA>-<MMGG>-<5 caratteri>` con alfabeto senza caratteri ambigui (niente
-`0 O 1 I L`), generato con `secrets` e rigenerato se già usato nel mese.
+`<handle>/<AAAA-MM>/<CODICE>/<n>_<nome-pulito>.<ext>`, un file per foto, niente
+sidecar. Il mese è quello di apertura del codice (fuso Europe/Rome); `n` = numero
+più alto presente + 1; l'estensione deriva dal formato reale. Il codice è
+`F-<MMGG>-<5 caratteri>` con alfabeto senza caratteri ambigui (niente `0 O 1 I L`),
+generato con `secrets` e rigenerato se già usato sotto **qualunque** prodotto e
+mese (cartella `<CODICE>` o vecchio file piatto `*_<CODICE>_*`). I vecchi file
+piatti `<AAAA-MM>/<AAAAMMGG-HHMM>_<CODICE>_<nome>.<ext>` restano dove sono.
+
+**Chiave di sessione.** `chiave = HMAC-SHA256(FOTO_SEGRETO, codice)`, primi 32
+caratteri hex: stateless, confrontata con `hmac.compare_digest`. Variabile
+d'ambiente `FOTO_SEGRETO` (almeno 32 caratteri) da passare al container
+`python-utils`; cambiarla invalida le chiavi dei carrelli aperti.
 
 **Difese** (il servizio è esposto su internet):
 - **CORS** ristretto ai soli domini del negozio, metodi `POST`/`OPTIONS`, senza
   credenziali. Le chiamate server-to-server (senza `Origin`) non cambiano.
-- **Rate limit** in memoria: 10 richieste/ora per IP e 200/giorno in totale
-  (429 oltre). L'IP è quello della connessione; `X-Forwarded-For` (primo valore)
-  è considerato solo se la connessione arriva dalla subnet del reverse proxy.
+- **Rate limit** in memoria, separati: caricamenti 20/ora per IP e 200/giorno in
+  totale; cancellazioni 30/ora per IP e 500/giorno. L'IP è quello della
+  connessione; `X-Forwarded-For` (primo valore) è considerato solo se la
+  connessione arriva dalla subnet del reverse proxy.
+- **Sessioni**: aggiungere e cancellare richiede la chiave; la cartella si cerca
+  solo sotto il prodotto richiesto (con un altro prodotto se ne crea una nuova lì,
+  l'altra non si tocca mai).
 - **Contenuto verificato** con Pillow/pillow-heif senza decodificare i pixel;
   lettura a blocchi con limite di dimensione.
-- **Percorsi** costruiti solo da valori validati: cartella da lista chiusa, codice
-  generato dal servizio, nome originale ripulito (`[A-Za-z0-9-]`, max 40).
+- **Percorsi** costruiti solo da valori validati (handle con regex, codice con
+  regex chiusa, numero intero, nome originale ripulito `[A-Za-z0-9-]` max 40) e
+  ogni file toccato deve risolversi dentro `FOTO_DIR`.
 - **Spazio disco** controllato prima di ogni salvataggio.
 
 Test: `pytest tests/test_foto.py`.

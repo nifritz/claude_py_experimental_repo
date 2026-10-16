@@ -1,4 +1,5 @@
-"""Test di POST /foto (foto dei clienti Bimbi Unici): servizio esposto su internet."""
+"""Test di POST /foto e POST /foto/elimina (foto dei clienti Bimbi Unici): servizio
+esposto su internet."""
 
 import hashlib
 import io
@@ -17,6 +18,8 @@ register_heif_opener()
 
 ORIGINE_OK = "https://bimbiunici.it"
 CODICE_RE = re.compile(r"^F-\d{4}-[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{5}$")
+SEGRETO_TEST = "segreto-di-test-lungo-almeno-32-caratteri!"
+PRODOTTO = "ritratto-da-foto-in-rilievo"
 GB = 1024**3
 DiskUsage = namedtuple("DiskUsage", "total used free")
 
@@ -30,13 +33,16 @@ def _immagine(formato: str, size=(64, 48), **kw) -> bytes:
 @pytest.fixture(autouse=True)
 def ambiente(tmp_path, monkeypatch):
     monkeypatch.setenv("FOTO_DIR", str(tmp_path))
+    monkeypatch.setenv("FOTO_SEGRETO", SEGRETO_TEST)
     # Spazio libero deterministico (il disco di sviluppo potrebbe essere sotto i 10 GB).
     monkeypatch.setattr(
         foto_clienti.shutil, "disk_usage", lambda _p: DiskUsage(10**12, 0, 10**12)
     )
     foto_clienti.limiter.reset()
+    foto_clienti.limiter_elimina.reset()
     yield
     foto_clienti.limiter.reset()
+    foto_clienti.limiter_elimina.reset()
 
 
 @pytest.fixture
@@ -44,22 +50,71 @@ def client():
     return TestClient(app)
 
 
-def _post(client, data: bytes, nome="foto.jpg", prodotto="ritratto-da-foto-in-rilievo"):
+def _post(
+    client,
+    data: bytes,
+    nome="foto.jpg",
+    prodotto=PRODOTTO,
+    sessione=None,
+    chiave=None,
+):
     form = {"prodotto": prodotto}
+    if sessione is not None:
+        form["sessione"] = sessione
+    if chiave is not None:
+        form["chiave"] = chiave
     return client.post("/foto", data=form, files={"file": (nome, data, "image/jpeg")})
 
 
 def _post_xff(client, data: bytes, xff: str):
     return client.post(
         "/foto",
-        data={"prodotto": "ritratto-da-foto-in-rilievo"},
+        data={"prodotto": PRODOTTO},
         files={"file": ("a.jpg", data, "image/jpeg")},
         headers={"X-Forwarded-For": xff},
     )
 
 
+def _elimina(client, sessione, chiave, numero, prodotto=PRODOTTO):
+    form = {
+        "prodotto": prodotto,
+        "sessione": sessione,
+        "chiave": chiave,
+        "numero": str(numero),
+    }
+    return client.post("/foto/elimina", data=form)
+
+
 def _file_salvati(tmp_path):
-    return [p for p in tmp_path.rglob("*") if p.is_file()]
+    return sorted(p for p in tmp_path.rglob("*") if p.is_file())
+
+
+def _istantanea(tmp_path) -> dict:
+    """Percorso relativo -> sha256 di ogni file: per verificare che nulla cambi."""
+    return {
+        p.relative_to(tmp_path).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in _file_salvati(tmp_path)
+    }
+
+
+def _sessione(client, n_foto=1, prodotto=PRODOTTO):
+    """Apre una sessione con `n_foto` foto; ritorna (codice, chiave, cartella)."""
+    r = _post(client, _immagine("JPEG"), prodotto=prodotto)
+    assert r.status_code == 200
+    codice, chiave = r.json()["codice"], r.json()["chiave"]
+    for _ in range(n_foto - 1):
+        r = _post(
+            client, _immagine("JPEG"), prodotto=prodotto, sessione=codice, chiave=chiave
+        )
+        assert r.status_code == 200
+    radice = foto_clienti.get_foto_dir()
+    cartella = foto_clienti.trova_cartella(radice, prodotto, codice)
+    assert cartella is not None
+    return codice, chiave, cartella
+
+
+def _numeri(cartella):
+    return sorted(int(p.name.split("_")[0]) for p in cartella.iterdir())
 
 
 # 1) JPEG valido ------------------------------------------------------------ #
@@ -70,36 +125,37 @@ def test_jpeg_valido_salvato_con_byte_identici(client, tmp_path):
     assert r.status_code == 200
     body = r.json()
     assert CODICE_RE.match(body["codice"])
-    assert body["codice"].startswith("F-")
+    assert body["numero"] == 1
+    assert body["chiave"] == foto_clienti.chiave_sessione(body["codice"])
+    assert re.fullmatch(r"[0-9a-f]{32}", body["chiave"])
     assert body["nome"] == nome
     assert body["byte"] == len(data)
 
-    # un file solo, niente sidecar: data, codice e prodotto stanno nel percorso
+    # un file solo, niente sidecar: prodotto, mese, codice e numero nel percorso
     salvati = _file_salvati(tmp_path)
     assert len(salvati) == 1
     jpg = salvati[0]
-    assert jpg.parent.parent.name == "ritratto-di-coppia"
+    ora = foto_clienti.datetime.now(foto_clienti.FUSO)
+    assert jpg.relative_to(tmp_path).parts == (
+        "ritratto-di-coppia",
+        f"{ora:%Y-%m}",
+        body["codice"],
+        "1_La-mia-foto-e-bella.jpg",
+    )
     sha = hashlib.sha256(data).hexdigest()
     assert hashlib.sha256(jpg.read_bytes()).hexdigest() == sha
-    assert re.fullmatch(
-        rf"\d{{8}}-\d{{4}}_{body['codice']}_La-mia-foto-e-bella\.jpg", jpg.name
-    )
 
 
 def test_file_esistente_mai_sovrascritto_ne_cancellato(tmp_path, monkeypatch):
     ora = foto_clienti.datetime.now(foto_clienti.FUSO)
-    mese = tmp_path / "ritratto-da-foto-in-rilievo" / f"{ora:%Y-%m}"
-    mese.mkdir(parents=True)
-    altrui = mese / f"{ora:%Y%m%d-%H%M}_F-0101-AAAAA_foto.jpg"
+    cartella = tmp_path / PRODOTTO / f"{ora:%Y-%m}" / "F-0101-AAAAA"
+    cartella.mkdir(parents=True)
+    altrui = cartella / "1_foto.jpg"
     altrui.write_bytes(b"foto di un altro cliente")
     monkeypatch.setattr(foto_clienti, "genera_codice", lambda *_: "F-0101-AAAAA")
-    monkeypatch.setattr(
-        foto_clienti, "datetime", type("D", (), {"now": lambda _tz: ora})
-    )
+    monkeypatch.setattr(foto_clienti, "_prossimo_numero", lambda _c: 1)
     with pytest.raises(FileExistsError):
-        foto_clienti.salva_foto(
-            _immagine("JPEG"), "foto.jpg", "ritratto-da-foto-in-rilievo"
-        )
+        foto_clienti.salva_foto(_immagine("JPEG"), "foto.jpg", PRODOTTO)
     assert altrui.read_bytes() == b"foto di un altro cliente"
 
 
@@ -123,7 +179,7 @@ def test_heic_valido_estensione_heic(client, tmp_path):
     data = _immagine("HEIF")
     r = _post(client, data, nome="IMG_0001.HEIC")
     assert r.status_code == 200
-    salvati = list(tmp_path.glob("ritratto-da-foto-in-rilievo/*/*.heic"))
+    salvati = list(tmp_path.glob(f"{PRODOTTO}/*/*/1_IMG-0001.heic"))
     assert len(salvati) == 1
     assert salvati[0].read_bytes() == data
 
@@ -140,7 +196,7 @@ def test_altri_formati_ammessi(client, tmp_path, formato, ext, kw):
     # Il nome inviato mente (.txt): conta solo il contenuto.
     r = _post(client, _immagine(formato, **kw), nome="x.txt")
     assert r.status_code == 200
-    assert len(list(tmp_path.glob(f"ritratto-da-foto-in-rilievo/*/*.{ext}"))) == 1
+    assert len(list(tmp_path.glob(f"{PRODOTTO}/*/*/*.{ext}"))) == 1
 
 
 # 3) File troppo grande ------------------------------------------------------ #
@@ -209,9 +265,10 @@ def test_prodotto_non_valido_e_esattamente_400(client):
 
 
 # 6) CORS -------------------------------------------------------------------- #
-def test_preflight_origine_ammessa(client):
+@pytest.mark.parametrize("percorso", ["/foto", "/foto/elimina"])
+def test_preflight_origine_ammessa(client, percorso):
     r = client.options(
-        "/foto",
+        percorso,
         headers={"Origin": ORIGINE_OK, "Access-Control-Request-Method": "POST"},
     )
     assert r.headers.get("access-control-allow-origin") == ORIGINE_OK
@@ -248,16 +305,18 @@ def test_chiamate_senza_origin_invariate(client):
 
 
 # 7) Rate limit --------------------------------------------------------------- #
-def test_undicesima_richiesta_429(client):
+def test_ventunesima_richiesta_429(client):
+    assert foto_clienti.RATE_PER_IP_ORA == 20
+    assert foto_clienti.RATE_TOTALE_GIORNO == 200
     data = _immagine("JPEG")
-    for _ in range(10):
+    for _ in range(20):
         assert _post(client, data).status_code == 200
     assert _post(client, data).status_code == 429
 
 
 def test_rate_limit_per_ip_indipendente(client):
     data = _immagine("JPEG")
-    for _ in range(10):
+    for _ in range(foto_clienti.RATE_PER_IP_ORA):
         assert _post(client, data).status_code == 200
     altro = TestClient(app, client=("203.0.113.9", 5000))
     assert _post(altro, data).status_code == 200
@@ -290,16 +349,36 @@ def test_200_codici_unici_e_alfabeto(tmp_path):
         assert codice[2:6] == f"{ora:%m%d}"
         assert not set(codice[7:]) & set("01OIL")
         codici.add(codice)
-        (tmp_path / f"20260101-1200_{codice}_foto.jpg").touch()
+        (tmp_path / PRODOTTO / f"{ora:%Y-%m}" / codice).mkdir(parents=True)
     assert len(codici) == 200
 
 
 def test_codice_gia_esistente_viene_rigenerato(tmp_path, monkeypatch):
     ora = foto_clienti.datetime.now(foto_clienti.FUSO)
-    (tmp_path / "20260101-1200_F-0101-AAAAA_foto.jpg").touch()
+    (tmp_path / PRODOTTO / "2026-10" / "F-0101-AAAAA").mkdir(parents=True)
     sequenza = iter(["F-0101-AAAAA", "F-0101-BBBBB"])
     monkeypatch.setattr(foto_clienti, "_codice_casuale", lambda *_: next(sequenza))
     assert foto_clienti.genera_codice(ora, tmp_path) == "F-0101-BBBBB"
+
+
+def test_vecchio_file_piatto_codice_non_riusato(tmp_path, monkeypatch):
+    ora = foto_clienti.datetime.now(foto_clienti.FUSO)
+    mese = tmp_path / PRODOTTO / "2026-07"
+    mese.mkdir(parents=True)
+    (mese / "20260714-1200_F-0714-K7M2X_foto.jpg").write_bytes(b"vecchia foto")
+    sequenza = iter(["F-0714-K7M2X", "F-0714-ZZZZZ"])
+    monkeypatch.setattr(foto_clienti, "_codice_casuale", lambda *_: next(sequenza))
+    assert foto_clienti.genera_codice(ora, tmp_path) == "F-0714-ZZZZZ"
+
+
+def test_codice_usato_in_altro_prodotto_o_anno_non_riusato(tmp_path, monkeypatch):
+    # La chiave dipende solo dal codice: riassegnarlo (stesso MMGG l'anno dopo, o
+    # sotto un altro prodotto) aprirebbe le foto di un cliente a un altro.
+    ora = foto_clienti.datetime.now(foto_clienti.FUSO)
+    (tmp_path / "disegno-dei-nonni" / "2025-10" / "F-1016-AAAAA").mkdir(parents=True)
+    sequenza = iter(["F-1016-AAAAA", "F-1016-BBBBB"])
+    monkeypatch.setattr(foto_clienti, "_codice_casuale", lambda *_: next(sequenza))
+    assert foto_clienti.genera_codice(ora, tmp_path) == "F-1016-BBBBB"
 
 
 # 9) Cartella del mese -------------------------------------------------------- #
@@ -328,7 +407,7 @@ def test_xff_usato_dal_proxy_nella_subnet():
 
 def test_xff_spoofato_da_fuori_subnet_non_aggira_il_limite(client):
     data = _immagine("JPEG")
-    for i in range(10):
+    for i in range(foto_clienti.RATE_PER_IP_ORA):
         assert _post_xff(client, data, f"9.9.9.{i}").status_code == 200
     assert _post_xff(client, data, "9.9.9.99").status_code == 429
 
@@ -336,7 +415,7 @@ def test_xff_spoofato_da_fuori_subnet_non_aggira_il_limite(client):
 def test_xff_dal_proxy_separa_i_clienti():
     proxy = TestClient(app, client=("172.18.0.5", 4000))
     data = _immagine("JPEG")
-    for _ in range(10):
+    for _ in range(foto_clienti.RATE_PER_IP_ORA):
         assert _post_xff(proxy, data, "1.2.3.4").status_code == 200
     assert _post_xff(proxy, data, "1.2.3.4").status_code == 429
     assert _post_xff(proxy, data, "5.6.7.8").status_code == 200
@@ -374,11 +453,365 @@ def test_filename_malevolo_non_esce_dalla_cartella(client, tmp_path):
     salvati = _file_salvati(tmp_path)
     assert salvati
     for p in salvati:
-        assert p.relative_to(tmp_path).parts[0] == "ritratto-da-foto-in-rilievo"
+        assert p.relative_to(tmp_path).parts[0] == PRODOTTO
 
 
 def test_nessun_get_su_foto(client):
     assert client.get("/foto").status_code == 405
+    assert client.get("/foto/elimina").status_code == 405
     rotte = [r for r in app.routes if getattr(r, "path", "").startswith("/foto")]
-    assert rotte
+    assert {r.path for r in rotte} == {"/foto", "/foto/elimina"}
     assert all(r.methods <= {"POST"} for r in rotte)
+
+
+# 11) Sessione: più foto per carrello ----------------------------------------- #
+def test_seconda_foto_stessa_cartella_numero_2(client, tmp_path):
+    codice, chiave, cartella = _sessione(client)
+    data = _immagine("PNG")
+    r = _post(client, data, nome="seconda.png", sessione=codice, chiave=chiave)
+    assert r.status_code == 200
+    body = r.json()
+    assert (body["codice"], body["numero"], body["chiave"]) == (codice, 2, chiave)
+    seconda = cartella / "2_seconda.png"
+    assert (
+        hashlib.sha256(seconda.read_bytes()).hexdigest()
+        == hashlib.sha256(data).hexdigest()
+    )
+    assert len(_file_salvati(tmp_path)) == 2  # tutte nella stessa cartella
+    assert {p.parent for p in _file_salvati(tmp_path)} == {cartella}
+
+
+def test_settima_foto_409_nessun_file_in_piu(client, tmp_path):
+    assert foto_clienti.MAX_FOTO == 6
+    codice, chiave, cartella = _sessione(client, n_foto=6)
+    prima = _istantanea(tmp_path)
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.status_code == 409
+    assert _istantanea(tmp_path) == prima
+
+
+def test_dopo_cancellazione_si_puo_ricaricare_fino_a_6(client):
+    codice, chiave, cartella = _sessione(client, n_foto=6)
+    assert _elimina(client, codice, chiave, 6).status_code == 200
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.status_code == 200
+    assert r.json()["numero"] == 6
+    assert (
+        _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave).status_code
+        == 409
+    )
+
+
+def test_numero_oltre_99_rifiutato_ogni_foto_resta_cancellabile(client):
+    codice, chiave, cartella = _sessione(client)
+    (cartella / "1_foto.jpg").rename(cartella / "99_foto.jpg")
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.status_code == 409
+    assert _numeri(cartella) == [99]
+
+
+def test_sessione_con_chiave_ma_senza_cartella_la_crea_nel_mese(client, tmp_path):
+    codice = "F-1016-7K3QX"
+    chiave = foto_clienti.chiave_sessione(codice)
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.status_code == 200
+    assert (r.json()["codice"], r.json()["numero"]) == (codice, 1)
+    ora = foto_clienti.datetime.now(foto_clienti.FUSO)
+    assert (tmp_path / PRODOTTO / f"{ora:%Y-%m}" / codice / "1_foto.jpg").is_file()
+
+
+def test_sessione_continuata_nel_mese_dopo_resta_nel_mese_di_creazione(
+    client, tmp_path, monkeypatch
+):
+    vera = foto_clienti.datetime
+
+    def orologio(momento):
+        monkeypatch.setattr(
+            foto_clienti, "datetime", type("D", (), {"now": lambda _tz: momento})
+        )
+
+    orologio(vera(2026, 10, 31, 23, 50, tzinfo=foto_clienti.FUSO))
+    r = _post(client, _immagine("JPEG"))
+    assert r.status_code == 200
+    codice, chiave = r.json()["codice"], r.json()["chiave"]
+    assert codice.startswith("F-1031-")
+
+    orologio(vera(2026, 11, 1, 0, 10, tzinfo=foto_clienti.FUSO))
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.status_code == 200
+    assert r.json()["numero"] == 2
+    assert sorted(p.name for p in (tmp_path / PRODOTTO).iterdir()) == ["2026-10"]
+    assert _numeri(tmp_path / PRODOTTO / "2026-10" / codice) == [1, 2]
+
+
+def test_sessione_di_altro_prodotto_crea_nel_prodotto_richiesto(client, tmp_path):
+    # La chiave dipende solo dal codice, quindi è valida anche con un altro prodotto.
+    # Comportamento voluto: la cartella si cerca SOLO sotto il prodotto richiesto;
+    # non trovandola se ne crea una nuova lì. Nell'altro prodotto non si scrive né
+    # si cancella mai.
+    codice, chiave, cartella_a = _sessione(client, prodotto="ritratto-di-coppia")
+    prima_a = {p.name: p.read_bytes() for p in cartella_a.iterdir()}
+
+    r = _post(
+        client,
+        _immagine("PNG"),
+        prodotto="disegno-dei-nonni",
+        sessione=codice,
+        chiave=chiave,
+    )
+    assert r.status_code == 200
+    assert (r.json()["codice"], r.json()["numero"]) == (codice, 1)
+    cartella_b = foto_clienti.trova_cartella(tmp_path, "disegno-dei-nonni", codice)
+    assert cartella_b is not None and cartella_b != cartella_a
+    assert _numeri(cartella_b) == [1]
+
+    assert (
+        _elimina(client, codice, chiave, 1, prodotto="disegno-dei-nonni").status_code
+        == 200
+    )
+    assert {p.name: p.read_bytes() for p in cartella_a.iterdir()} == prima_a
+    assert list(cartella_b.iterdir()) == []
+
+
+def test_cancellazione_con_prodotto_sbagliato_404_non_tocca_nulla(client, tmp_path):
+    codice, chiave, _cartella = _sessione(client, prodotto="ritratto-di-coppia")
+    prima = _istantanea(tmp_path)
+    assert (
+        _elimina(client, codice, chiave, 1, prodotto="disegno-dei-nonni").status_code
+        == 404
+    )
+    assert _istantanea(tmp_path) == prima
+
+
+# 12) Chiave e segreto --------------------------------------------------------- #
+@pytest.mark.parametrize("chiave", ["0" * 32, "", "è" * 32, None])
+def test_chiave_sbagliata_403_su_aggiunta(client, tmp_path, chiave):
+    codice, giusta, _cartella = _sessione(client)
+    prima = _istantanea(tmp_path)
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.status_code == 403
+    assert _istantanea(tmp_path) == prima
+
+
+@pytest.mark.parametrize("chiave", ["0" * 32, "", "è" * 32])
+def test_chiave_sbagliata_403_su_cancellazione(client, tmp_path, chiave):
+    codice, _giusta, _cartella = _sessione(client)
+    prima = _istantanea(tmp_path)
+    r = _elimina(client, codice, chiave, 1)
+    assert r.status_code in (403, 422)  # "" è rifiutato già come campo mancante
+    if chiave:
+        assert r.status_code == 403
+    assert _istantanea(tmp_path) == prima
+
+
+def test_chiave_di_un_altro_codice_403(client, tmp_path):
+    codice_a, _chiave_a, _ = _sessione(client)
+    _codice_b, chiave_b, _ = _sessione(client)
+    prima = _istantanea(tmp_path)
+    assert (
+        _post(client, _immagine("JPEG"), sessione=codice_a, chiave=chiave_b).status_code
+        == 403
+    )
+    assert _elimina(client, codice_a, chiave_b, 1).status_code == 403
+    assert _istantanea(tmp_path) == prima
+
+
+def test_chiave_e_hmac_del_codice():
+    import hmac as hmac_mod
+
+    attesa = hmac_mod.new(SEGRETO_TEST.encode(), b"F-1016-7K3QX", hashlib.sha256)
+    assert foto_clienti.chiave_sessione("F-1016-7K3QX") == attesa.hexdigest()[:32]
+
+
+@pytest.mark.parametrize("segreto", [None, "", "x" * 31])
+def test_segreto_assente_o_corto(client, tmp_path, monkeypatch, segreto):
+    if segreto is None:
+        monkeypatch.delenv("FOTO_SEGRETO")
+    else:
+        monkeypatch.setenv("FOTO_SEGRETO", segreto)
+    # Il tema di oggi (solo file + prodotto) continua a funzionare.
+    r = _post(client, _immagine("JPEG"))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["chiave"] is None
+    assert body["numero"] == 1
+    prima = _istantanea(tmp_path)
+    # Tutto ciò che richiede la chiave risponde 503, senza toccare file.
+    r = _post(client, _immagine("JPEG"), sessione=body["codice"], chiave="0" * 32)
+    assert r.status_code == 503
+    assert _elimina(client, body["codice"], "0" * 32, 1).status_code == 503
+    assert _istantanea(tmp_path) == prima
+
+
+def test_segreto_da_32_caratteri_basta(monkeypatch):
+    monkeypatch.setenv("FOTO_SEGRETO", "x" * 32)
+    assert foto_clienti.chiave_sessione("F-1016-7K3QX") is not None
+
+
+# 13) Sessione malformata ------------------------------------------------------ #
+SESSIONI_MALFORMATE = [
+    "../x",
+    "F-1016-7K3QX/..",
+    "f-1016-7k3qx",
+    "*",
+    "F-1016-7K3Q*",
+    "F-1016-7K3QO",  # O non è nell'alfabeto
+    "F-1016-7K3QX\n",
+    "../../F-1016-7K3QX",
+]
+
+
+@pytest.mark.parametrize("sessione", SESSIONI_MALFORMATE)
+def test_sessione_malformata_400_su_aggiunta(client, tmp_path, sessione):
+    r = _post(client, _immagine("JPEG"), sessione=sessione, chiave="0" * 32)
+    assert r.status_code == 400
+    assert _file_salvati(tmp_path) == []
+    assert list(tmp_path.iterdir()) == []  # nemmeno cartelle
+
+
+@pytest.mark.parametrize("sessione", SESSIONI_MALFORMATE)
+def test_sessione_malformata_400_su_cancellazione(client, tmp_path, sessione):
+    _sessione(client, n_foto=2)
+    prima = _istantanea(tmp_path)
+    r = _elimina(client, sessione, "0" * 32, 1)
+    assert r.status_code == 400
+    assert _istantanea(tmp_path) == prima
+
+
+def test_sessione_malformata_400_anche_senza_segreto(client, monkeypatch):
+    monkeypatch.delenv("FOTO_SEGRETO")
+    assert (
+        _post(client, _immagine("JPEG"), sessione="../x", chiave="x").status_code == 400
+    )
+
+
+# 14) Cancellazione ------------------------------------------------------------ #
+def test_cancellazione_toglie_solo_quel_numero(client, tmp_path):
+    codice, chiave, cartella = _sessione(client, n_foto=3)
+    altri = {
+        p.name: p.read_bytes()
+        for p in cartella.iterdir()
+        if not p.name.startswith("2_")
+    }
+    r = _elimina(client, codice, chiave, 2)
+    assert r.status_code == 200
+    assert r.json() == {"codice": codice, "numero": 2, "eliminata": True}
+    assert {p.name: p.read_bytes() for p in cartella.iterdir()} == altri
+
+
+def test_cancellato_il_2_la_successiva_e_4(client):
+    codice, chiave, cartella = _sessione(client, n_foto=3)
+    assert _elimina(client, codice, chiave, 2).status_code == 200
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.json()["numero"] == 4
+    assert _numeri(cartella) == [1, 3, 4]
+
+
+def test_cancellato_il_3_la_successiva_e_3(client):
+    codice, chiave, cartella = _sessione(client, n_foto=3)
+    assert _elimina(client, codice, chiave, 3).status_code == 200
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.json()["numero"] == 3
+    assert _numeri(cartella) == [1, 2, 3]
+
+
+def test_cancellare_1_non_tocca_11(client):
+    codice, chiave, cartella = _sessione(client)
+    (cartella / "11_foto.jpg").write_bytes(b"undici")
+    assert _elimina(client, codice, chiave, 1).status_code == 200
+    assert [p.name for p in cartella.iterdir()] == ["11_foto.jpg"]
+
+
+def test_symlink_verso_fuori_foto_dir_non_cancellato(client, tmp_path_factory):
+    codice, chiave, cartella = _sessione(client)
+    fuori = tmp_path_factory.mktemp("fuori") / "segreto.txt"
+    fuori.write_bytes(b"non toccare")
+    try:
+        (cartella / "2_link.jpg").symlink_to(fuori)
+    except OSError:
+        pytest.skip("symlink non disponibili su questo sistema")
+    assert _elimina(client, codice, chiave, 2).status_code == 404
+    assert fuori.read_bytes() == b"non toccare"
+    assert (cartella / "2_link.jpg").is_symlink()
+
+
+def test_cartella_vuota_resta(client):
+    codice, chiave, cartella = _sessione(client)
+    assert _elimina(client, codice, chiave, 1).status_code == 200
+    assert cartella.is_dir()
+    assert list(cartella.iterdir()) == []
+    # e la sessione continua a funzionare: n riparte da 1
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.json()["numero"] == 1
+
+
+def test_numero_inesistente_404(client, tmp_path):
+    codice, chiave, _cartella = _sessione(client, n_foto=2)
+    prima = _istantanea(tmp_path)
+    assert _elimina(client, codice, chiave, 5).status_code == 404
+    assert _istantanea(tmp_path) == prima
+
+
+def test_sessione_senza_cartella_404(client, tmp_path):
+    codice = "F-1016-7K3QX"
+    r = _elimina(client, codice, foto_clienti.chiave_sessione(codice), 1)
+    assert r.status_code == 404
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "numero", ["0", "-1", "100", "1/../x", "*", "1_*", "", "1.5", "abc"]
+)
+def test_numero_non_valido_rifiutato_senza_toccare_nulla(client, tmp_path, numero):
+    codice, chiave, _cartella = _sessione(client, n_foto=3)
+    prima = _istantanea(tmp_path)
+    r = _elimina(client, codice, chiave, numero)
+    assert r.status_code in (400, 422)
+    assert _istantanea(tmp_path) == prima
+
+
+@pytest.mark.parametrize("numero", [0, -1, 100, "1", 1.0, True, None])
+def test_valida_numero_difesa_in_profondita(numero):
+    with pytest.raises(foto_clienti.NumeroNonValido):
+        foto_clienti.valida_numero(numero)
+
+
+def test_elimina_foto_logica_rifiuta_numero_non_valido(client, tmp_path):
+    codice, chiave, _cartella = _sessione(client)
+    prima = _istantanea(tmp_path)
+    with pytest.raises(foto_clienti.NumeroNonValido):
+        foto_clienti.elimina_foto(PRODOTTO, codice, chiave, "1_*")
+    assert _istantanea(tmp_path) == prima
+
+
+# 15) Rate limit cancellazioni -------------------------------------------------- #
+def test_rate_limit_cancellazioni_valori():
+    assert foto_clienti.limiter_elimina.per_ip_ora == 30
+    assert foto_clienti.limiter_elimina.totale_giorno == 500
+    assert foto_clienti.limiter_elimina is not foto_clienti.limiter
+
+
+def test_caricamenti_esauriti_cancellazione_funziona(client):
+    codice, chiave, _cartella = _sessione(client, n_foto=2)
+    data = _immagine("JPEG")
+    while _post(client, data).status_code == 200:
+        pass
+    assert _post(client, data).status_code == 429
+    assert _elimina(client, codice, chiave, 2).status_code == 200
+
+
+def test_cancellazioni_esaurite_caricamento_funziona(client, monkeypatch):
+    codice, chiave, _cartella = _sessione(client)
+    monkeypatch.setattr(foto_clienti.limiter_elimina, "per_ip_ora", 3)
+    for _ in range(3):
+        assert _elimina(client, codice, chiave, 9).status_code == 404
+    assert _elimina(client, codice, chiave, 1).status_code == 429
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.status_code == 200
+
+
+def test_trentunesima_cancellazione_429(client):
+    codice, chiave, _cartella = _sessione(client)
+    for _ in range(30):
+        assert _elimina(client, codice, chiave, 9).status_code == 404
+    assert _elimina(client, codice, chiave, 1).status_code == 429

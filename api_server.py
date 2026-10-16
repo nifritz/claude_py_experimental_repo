@@ -16,7 +16,8 @@ Endpoints:
     POST /approssima-colori   → riduce i colori di un'immagine alla palette hardcodata
     POST /reduce-image        → riduce il peso di un'immagine PNG sotto una soglia in MB
     POST /converti-in-svg     → vettorizza un PNG in SVG AMS-ready (Inkscape-ready)
-    POST /foto                → salva foto cliente Bimbi Unici, ritorna un codice
+    POST /foto                → salva foto cliente Bimbi Unici (fino a 6 per codice)
+    POST /foto/elimina        → cancella una foto del codice, con la sua chiave
 """
 
 import io
@@ -342,11 +343,24 @@ def serve_proposta_pdf(token: str) -> FileResponse:
 
 _FOTO_STATUS = {
     foto_clienti.ProdottoNonValido: 400,
+    foto_clienti.SessioneNonValida: 400,
+    foto_clienti.NumeroNonValido: 400,
+    foto_clienti.ChiaveNonValida: 403,
+    foto_clienti.FotoNonTrovata: 404,
+    foto_clienti.TroppeFoto: 409,
     foto_clienti.FileTroppoGrande: 413,
     foto_clienti.FormatoNonSupportato: 415,
     foto_clienti.TroppeRichieste: 429,
+    foto_clienti.ServizioNonConfigurato: 503,
     foto_clienti.DiscoPieno: 507,
 }
+
+
+def _ip_foto(request: Request) -> str:
+    return foto_clienti.ip_cliente(
+        request.client.host if request.client else None,
+        request.headers.get("x-forwarded-for"),
+    )
 
 
 @app.post("/foto")
@@ -354,25 +368,30 @@ async def carica_foto(
     request: Request,
     file: UploadFile,
     prodotto: str = Form(...),
+    sessione: str | None = Form(None),
+    chiave: str | None = Form(None),
 ) -> dict:
     """
     Riceve la foto originale di un cliente (dal browser, pagina prodotto Shopify),
-    la salva su disco senza ricodificarla e ritorna un codice breve.
+    la salva su disco senza ricodificarla e ritorna il codice del carrello.
 
-    multipart/form-data: file, prodotto (handle Shopify = nome della cartella).
-    Risposta: {"codice": "F-0714-K7M2X", "nome": "<nome originale>", "byte": 123456}.
+    multipart/form-data: file, prodotto (handle Shopify = nome della cartella),
+    facoltativi sessione + chiave (codice e chiave ricevuti dal primo caricamento).
+    Senza sessione apre un codice nuovo (foto n. 1); con sessione aggiunge la foto
+    successiva nella stessa cartella, massimo 6 (409 oltre).
+    Risposta: {"codice": "F-0714-K7M2X", "numero": 1, "chiave": "<32 hex> | null",
+    "nome": "<nome originale>", "byte": 123456}.
 
-    Esposto su internet: rate limit, CORS ristretto, controllo del contenuto e dello
-    spazio disco. NON esiste (e non va aggiunto) nessun GET che serva questi file.
+    Esposto su internet: rate limit, CORS ristretto, chiave HMAC per le sessioni,
+    controllo del contenuto e dello spazio disco. NON esiste (e non va aggiunto)
+    nessun GET che serva questi file.
     """
     try:
-        ip = foto_clienti.ip_cliente(
-            request.client.host if request.client else None,
-            request.headers.get("x-forwarded-for"),
-        )
-        if not foto_clienti.limiter.consenti(ip):
+        if not foto_clienti.limiter.consenti(_ip_foto(request)):
             raise foto_clienti.TroppeRichieste("Troppe richieste, riprova più tardi")
         foto_clienti.valida_prodotto(prodotto)
+        if sessione:
+            foto_clienti.verifica_sessione(sessione, chiave)
 
         blocchi: list[bytes] = []
         totale = 0
@@ -389,11 +408,48 @@ async def carica_foto(
             b"".join(blocchi),
             file.filename,
             prodotto,
+            sessione,
+            chiave,
         )
     except foto_clienti.FotoError as exc:
         status = _FOTO_STATUS[type(exc)]
         raise HTTPException(status_code=status, detail=exc.detail) from exc
-    logging.info("foto salvata: codice=%s byte=%d", result["codice"], totale)
+    logging.info(
+        "foto salvata: codice=%s numero=%d byte=%d",
+        result["codice"],
+        result["numero"],
+        totale,
+    )
+    return result
+
+
+@app.post("/foto/elimina")
+async def elimina_foto(
+    request: Request,
+    prodotto: str = Form(...),
+    sessione: str = Form(...),
+    chiave: str = Form(...),
+    numero: int = Form(..., ge=1, le=foto_clienti.NUMERO_MAX),
+) -> dict:
+    """
+    Cancella una foto del carrello: solo il file numero `numero` nella cartella
+    della sessione, sotto il prodotto indicato. La cartella resta.
+
+    form: prodotto, sessione, chiave, numero (intero 1..99).
+    Risposta: {"codice": "F-0714-K7M2X", "numero": 2, "eliminata": true}.
+    Errori: 400 input non validi, 403 chiave sbagliata, 404 foto inesistente,
+    429 rate limit (separato dai caricamenti), 503 segreto non configurato.
+    """
+    try:
+        if not foto_clienti.limiter_elimina.consenti(_ip_foto(request)):
+            raise foto_clienti.TroppeRichieste("Troppe richieste, riprova più tardi")
+        result = await run_in_threadpool(
+            foto_clienti.elimina_foto, prodotto, sessione, chiave, numero
+        )
+    except foto_clienti.FotoError as exc:
+        status = _FOTO_STATUS[type(exc)]
+        raise HTTPException(status_code=status, detail=exc.detail) from exc
+    logging.info("foto eliminata: codice=%s numero=%d", result["codice"], numero)
     return result
 
 

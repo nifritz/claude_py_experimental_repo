@@ -2,16 +2,28 @@
 foto_clienti.py
 
 Logica pura del servizio foto dei clienti (Bimbi Unici): validazione, rate limit,
-generazione del codice e salvataggio su disco. Nessun riferimento HTTP: gli
-errori sono eccezioni `FotoError` che `api_server.py` traduce in status code.
+generazione del codice, chiave di sessione, salvataggio e cancellazione su disco.
+Nessun riferimento HTTP: gli errori sono eccezioni `FotoError` che `api_server.py`
+traduce in status code.
+
+Layout: FOTO_DIR/<handle>/<AAAA-MM>/<CODICE>/<n>_<nome-pulito>.<ext>
+Un CODICE ("padre") per carrello = una cartella con al massimo MAX_FOTO foto,
+numerate da 1 senza mai rinumerare (n = massimo presente + 1). Il cliente aggiunge
+e cancella le proprie foto presentando CODICE + chiave, dove la chiave è un HMAC
+del codice col segreto FOTO_SEGRETO: nessuno stato lato server oltre ai file.
+I vecchi file piatti (<AAAA-MM>/<AAAAMMGG-HHMM>_<CODICE>_<nome>.<ext>) restano dove
+sono e il loro codice non viene mai riassegnato.
 
 Il servizio è esposto su internet: i percorsi si costruiscono SOLO da valori
-validati (handle del prodotto controllato, codice generato qui, nome ripulito).
+validati (handle del prodotto controllato, codice con regex chiusa, numero intero,
+nome ripulito) e ogni percorso toccato deve risolversi dentro FOTO_DIR.
 Ogni prodotto ha la sua cartella, col nome del suo handle: nessuna lista da tenere.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import io
 import ipaddress
 import os
@@ -42,9 +54,20 @@ FORMATI = {"JPEG": "jpg", "MPO": "jpg", "PNG": "png", "HEIF": "heic", "WEBP": "w
 
 ALFABETO_CODICE = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"  # niente 0, O, 1, I, L
 LUNGHEZZA_CODICE = 5
+_CODICE_RE = re.compile(rf"F-\d{{4}}-[{ALFABETO_CODICE}]{{{LUNGHEZZA_CODICE}}}")
 
-RATE_PER_IP_ORA = 10
+MAX_FOTO = 6  # foto per cartella (per carrello)
+NUMERO_MAX = 99  # oltre non si salva: ogni foto deve restare cancellabile
+_NUMERATO_RE = re.compile(r"(\d+)_")
+_MESE_RE = re.compile(r"\d{4}-\d{2}")
+
+SEGRETO_MIN = 32
+LUNGHEZZA_CHIAVE = 32
+
+RATE_PER_IP_ORA = 20
 RATE_TOTALE_GIORNO = 200
+RATE_ELIMINA_PER_IP_ORA = 30
+RATE_ELIMINA_TOTALE_GIORNO = 500
 PROXY_SUBNET = ipaddress.ip_network("172.18.0.0/16")
 
 FUSO = ZoneInfo("Europe/Rome")
@@ -87,6 +110,30 @@ class TroppeRichieste(FotoError):
     kind = "rate_limit"
 
 
+class SessioneNonValida(FotoError):
+    kind = "sessione"
+
+
+class NumeroNonValido(FotoError):
+    kind = "numero"
+
+
+class ChiaveNonValida(FotoError):
+    kind = "chiave"
+
+
+class ServizioNonConfigurato(FotoError):
+    kind = "configurazione"
+
+
+class TroppeFoto(FotoError):
+    kind = "troppe_foto"
+
+
+class FotoNonTrovata(FotoError):
+    kind = "non_trovata"
+
+
 # --------------------------------------------------------------------------- #
 # Configurazione
 # --------------------------------------------------------------------------- #
@@ -95,6 +142,14 @@ class TroppeRichieste(FotoError):
 def get_foto_dir() -> Path:
     """Radice di salvataggio (letta a ogni chiamata, così i test possono cambiarla)."""
     return Path(os.environ.get("FOTO_DIR", "/app/caricati"))
+
+
+def get_segreto() -> bytes | None:
+    """FOTO_SEGRETO (letto a ogni chiamata); None se assente o sotto SEGRETO_MIN."""
+    segreto = os.environ.get("FOTO_SEGRETO", "")
+    if len(segreto) < SEGRETO_MIN:
+        return None
+    return segreto.encode()
 
 
 # --------------------------------------------------------------------------- #
@@ -144,7 +199,8 @@ class RateLimiter:
             return True
 
 
-limiter = RateLimiter()
+limiter = RateLimiter()  # caricamenti
+limiter_elimina = RateLimiter(RATE_ELIMINA_PER_IP_ORA, RATE_ELIMINA_TOTALE_GIORNO)
 
 
 def ip_cliente(client_host: str | None, x_forwarded_for: str | None) -> str:
@@ -174,6 +230,41 @@ def valida_prodotto(prodotto: str | None) -> str:
     if not prodotto or not _PRODOTTO_RE.fullmatch(prodotto):
         raise ProdottoNonValido("Prodotto non valido")
     return prodotto
+
+
+def valida_codice(codice: str | None) -> str:
+    """Codice 'F-<MMGG>-<5 caratteri>' (regex chiusa) o SessioneNonValida."""
+    if not codice or not _CODICE_RE.fullmatch(codice):
+        raise SessioneNonValida("Sessione non valida")
+    return codice
+
+
+def chiave_sessione(codice: str) -> str | None:
+    """HMAC-SHA256(FOTO_SEGRETO, codice), 32 caratteri hex; None senza segreto."""
+    segreto = get_segreto()
+    if segreto is None:
+        return None
+    digest = hmac.new(segreto, codice.encode(), hashlib.sha256).hexdigest()
+    return digest[:LUNGHEZZA_CHIAVE]
+
+
+def verifica_sessione(codice: str | None, chiave: str | None) -> str:
+    """Formato del codice (400) -> segreto configurato (503) -> chiave (403)."""
+    codice = valida_codice(codice)
+    attesa = chiave_sessione(codice)
+    if attesa is None:
+        raise ServizioNonConfigurato("Servizio non configurato")
+    # bytes: compare_digest su str non ASCII solleverebbe TypeError (-> 500)
+    if not hmac.compare_digest((chiave or "").encode(), attesa.encode()):
+        raise ChiaveNonValida("Chiave non valida")
+    return codice
+
+
+def valida_numero(numero: int) -> int:
+    """Numero della foto, intero 1..NUMERO_MAX, o NumeroNonValido."""
+    if type(numero) is not int or not 1 <= numero <= NUMERO_MAX:
+        raise NumeroNonValido("Numero non valido")
+    return numero
 
 
 def pulisci_nome(filename: str | None) -> str:
@@ -223,39 +314,99 @@ def _codice_casuale(ora: datetime) -> str:
     return f"{LETTERA_CODICE}-{ora:%m%d}-{suffisso}"
 
 
-def genera_codice(ora: datetime, cartella_mese: Path) -> str:
-    """Codice 'F-<MMGG>-<5 caratteri>', rigenerato se già usato nel mese."""
+def _codice_usato(codice: str, radice: Path) -> bool:
+    """Usato se esiste, sotto QUALUNQUE prodotto e mese, la cartella <CODICE> o un
+    vecchio file piatto *_<CODICE>_*: la chiave dipende solo dal codice, quindi un
+    codice riassegnato darebbe accesso alle foto di un altro cliente."""
+    return any(radice.glob(f"*/*/{codice}")) or any(radice.glob(f"*/*/*_{codice}_*"))
+
+
+def genera_codice(ora: datetime, radice: Path) -> str:
+    """Codice 'F-<MMGG>-<5 caratteri>', rigenerato se già usato sotto `radice`."""
     while True:
         codice = _codice_casuale(ora)
-        if not cartella_mese.is_dir() or not any(cartella_mese.glob(f"*_{codice}_*")):
+        if not _codice_usato(codice, radice):
             return codice
+
+
+def _dentro(percorso: Path, radice: Path) -> bool:
+    """True se `percorso`, risolto (symlink compresi), sta dentro `radice`."""
+    return percorso.resolve().is_relative_to(radice.resolve())
+
+
+def trova_cartella(radice: Path, prodotto: str, codice: str) -> Path | None:
+    """Cartella della sessione fra i mesi <AAAA-MM> del prodotto, o None.
+
+    Si cerca solo sotto il prodotto richiesto: mai nella cartella di un altro handle.
+    """
+    base = radice / prodotto
+    if not base.is_dir():
+        return None
+    for mese in sorted(base.iterdir()):
+        if not _MESE_RE.fullmatch(mese.name):
+            continue
+        cartella = mese / codice
+        if cartella.is_dir() and _dentro(cartella, radice):
+            return cartella
+    return None
+
+
+def _prossimo_numero(cartella: Path) -> int:
+    """Massimo presente + 1 (1 se vuota); TroppeFoto oltre MAX_FOTO o NUMERO_MAX."""
+    numeri = [
+        int(m.group(1))
+        for p in cartella.iterdir()
+        if (m := _NUMERATO_RE.match(p.name)) and p.is_file()
+    ]
+    if len(numeri) >= MAX_FOTO:
+        raise TroppeFoto(f"Massimo {MAX_FOTO} foto")
+    numero = max(numeri, default=0) + 1
+    if numero > NUMERO_MAX:
+        raise TroppeFoto("Troppe foto per questa sessione")
+    return numero
 
 
 def salva_foto(
     data: bytes,
     filename: str | None,
     prodotto: str | None,
+    sessione: str | None = None,
+    chiave: str | None = None,
 ) -> dict:
-    """Salva i byte ORIGINALI (nessuna ricodifica), un file solo: data, codice e
-    prodotto stanno nel percorso, il nome originale nella riga dell'ordine.
+    """Salva i byte ORIGINALI (nessuna ricodifica), un file solo per foto: prodotto,
+    mese, codice e numero stanno nel percorso, il nome originale nella risposta.
 
-    Ritorna {"codice", "nome", "byte"}. Solleva FotoError per input non validi.
+    Senza `sessione` apre un codice nuovo (foto n. 1). Con `sessione` + `chiave`
+    aggiunge alla cartella della sessione sotto questo prodotto (anche se di un mese
+    precedente) o, se non c'è, la crea nel mese corrente.
+
+    Ritorna {"codice", "numero", "chiave", "nome", "byte"}; "chiave" è None se
+    FOTO_SEGRETO manca. Solleva FotoError per input non validi.
     """
-    cartella = valida_prodotto(prodotto)
+    handle = valida_prodotto(prodotto)
+    if sessione:
+        sessione = verifica_sessione(sessione, chiave)
     _formato, ext, _larghezza, _altezza = ispeziona_immagine(data)
     controlla_spazio()
 
+    radice = get_foto_dir()
     ora = datetime.now(FUSO)
-    cartella_mese = get_foto_dir() / cartella / f"{ora:%Y-%m}"
+    cartella_mese = radice / handle / f"{ora:%Y-%m}"
     nome_originale = (filename or "")[:_NOME_ORIGINALE_MAX]
     nome_pulito = pulisci_nome(filename)
 
     with _lock:
-        cartella_mese.mkdir(parents=True, exist_ok=True)
-        codice = genera_codice(ora, cartella_mese)
-        percorso_foto = (
-            cartella_mese / f"{ora:%Y%m%d-%H%M}_{codice}_{nome_pulito}.{ext}"
-        )
+        if sessione:
+            codice = sessione
+            cartella = trova_cartella(radice, handle, codice) or cartella_mese / codice
+        else:
+            codice = genera_codice(ora, radice)
+            cartella = cartella_mese / codice
+        if not _dentro(cartella, radice):
+            raise SessioneNonValida("Sessione non valida")
+        cartella.mkdir(parents=True, exist_ok=True)
+        numero = _prossimo_numero(cartella)
+        percorso_foto = cartella / f"{numero}_{nome_pulito}.{ext}"
         with open(percorso_foto, "xb") as f:  # "x": mai sovrascrivere
             try:
                 f.write(data)
@@ -264,4 +415,44 @@ def salva_foto(
                 percorso_foto.unlink(missing_ok=True)  # solo quello creato qui
                 raise
 
-    return {"codice": codice, "nome": nome_originale, "byte": len(data)}
+    return {
+        "codice": codice,
+        "numero": numero,
+        "chiave": chiave_sessione(codice),
+        "nome": nome_originale,
+        "byte": len(data),
+    }
+
+
+def elimina_foto(
+    prodotto: str | None,
+    sessione: str | None,
+    chiave: str | None,
+    numero: int,
+) -> dict:
+    """Cancella la foto `numero` della sessione: solo i file f"{numero}_*" della sua
+    cartella sotto questo prodotto, e solo se risolti dentro FOTO_DIR. La cartella,
+    anche se resta vuota, non si tocca.
+
+    Ritorna {"codice", "numero", "eliminata": True}; FotoNonTrovata se non c'è.
+    """
+    handle = valida_prodotto(prodotto)
+    codice = verifica_sessione(sessione, chiave)
+    numero = valida_numero(numero)
+    radice = get_foto_dir()
+
+    with _lock:
+        cartella = trova_cartella(radice, handle, codice)
+        if cartella is None:
+            raise FotoNonTrovata("Foto non trovata")
+        da_eliminare = [
+            p
+            for p in cartella.glob(f"{numero}_*")
+            if p.is_file() and _dentro(p, radice)
+        ]
+        if not da_eliminare:
+            raise FotoNonTrovata("Foto non trovata")
+        for p in da_eliminare:
+            p.unlink()
+
+    return {"codice": codice, "numero": numero, "eliminata": True}
