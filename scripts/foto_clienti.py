@@ -13,6 +13,10 @@ e cancella le proprie foto presentando CODICE + chiave, dove la chiave è un HMA
 del codice col segreto FOTO_SEGRETO: nessuno stato lato server oltre ai file.
 I vecchi file piatti (<AAAA-MM>/<AAAAMMGG-HHMM>_<CODICE>_<nome>.<ext>) restano dove
 sono e il loro codice non viene mai riassegnato.
+Ogni caricamento porta l'email del cliente (obbligatoria): nella cartella del codice
+il server tiene `contatto.txt` (email, codice, prodotto, aggiornato). Non è una foto:
+non conta nel limite, non entra nella numerazione e la cancellazione (che accetta solo
+numeri) non lo raggiunge mai.
 
 Il servizio è esposto su internet: i percorsi si costruiscono SOLO da valori
 validati (handle del prodotto controllato, codice con regex chiusa, numero intero,
@@ -60,6 +64,18 @@ MAX_FOTO = 6  # foto per cartella (per carrello)
 NUMERO_MAX = 99  # oltre non si salva: ogni foto deve restare cancellabile
 _NUMERATO_RE = re.compile(r"(\d+)_")
 _MESE_RE = re.compile(r"\d{4}-\d{2}")
+
+CONTATTO = "contatto.txt"
+_CONTATTO_TMP = ".contatto.txt.tmp"  # non inizia con "<n>_": mai scambiato per una foto
+EMAIL_MAX = 254
+EMAIL_LOCALE_MAX = 64
+# Vietati in ogni parte: spazi e a capo (\s), @ e caratteri di controllo (C0, DEL, C1).
+_EMAIL_VIETATI = r"\s@\x00-\x1f\x7f-\x9f"
+# parte locale 1..64 @ dominio: etichette non vuote separate da punti, almeno un punto
+_EMAIL_RE = re.compile(
+    rf"([^{_EMAIL_VIETATI}]{{1,{EMAIL_LOCALE_MAX}}})"
+    rf"@([^{_EMAIL_VIETATI}.]+(?:\.[^{_EMAIL_VIETATI}.]+)+)"
+)
 
 SEGRETO_MIN = 32
 LUNGHEZZA_CHIAVE = 32
@@ -120,6 +136,10 @@ class NumeroNonValido(FotoError):
 
 class ChiaveNonValida(FotoError):
     kind = "chiave"
+
+
+class EmailNonValida(FotoError):
+    kind = "email"
 
 
 class ServizioNonConfigurato(FotoError):
@@ -230,6 +250,22 @@ def valida_prodotto(prodotto: str | None) -> str:
     if not prodotto or not _PRODOTTO_RE.fullmatch(prodotto):
         raise ProdottoNonValido("Prodotto non valido")
     return prodotto
+
+
+def valida_email(email: str | None) -> str:
+    """Email normalizzata (strip, dominio minuscolo) o EmailNonValida.
+
+    Controllo solo di forma, senza DNS: max 254 caratteri, una sola @, parte locale
+    1..64, dominio con almeno un punto e senza etichette vuote, niente spazi né
+    caratteri di controllo. La parte locale resta com'è (per standard è case-sensitive).
+    """
+    pulita = (email or "").strip()
+    if len(pulita) > EMAIL_MAX:
+        raise EmailNonValida("Email non valida")
+    trovata = _EMAIL_RE.fullmatch(pulita)
+    if trovata is None:
+        raise EmailNonValida("Email non valida")
+    return f"{trovata.group(1)}@{trovata.group(2).lower()}"
 
 
 def valida_codice(codice: str | None) -> str:
@@ -352,7 +388,10 @@ def trova_cartella(radice: Path, prodotto: str, codice: str) -> Path | None:
 
 
 def _prossimo_numero(cartella: Path) -> int:
-    """Massimo presente + 1 (1 se vuota); TroppeFoto oltre MAX_FOTO o NUMERO_MAX."""
+    """Massimo presente + 1 (1 se vuota); TroppeFoto oltre MAX_FOTO o NUMERO_MAX.
+
+    Contano solo i file "<n>_*": contatto.txt non è una foto e viene ignorato.
+    """
     numeri = [
         int(m.group(1))
         for p in cartella.iterdir()
@@ -366,12 +405,36 @@ def _prossimo_numero(cartella: Path) -> int:
     return numero
 
 
+def _scrivi_contatto(cartella: Path, email: str, codice: str, handle: str) -> None:
+    """Scrive contatto.txt se manca o se la mail è cambiata (vale l'ultima); se la
+    mail è la stessa non lo tocca (resta il momento di apertura). Atomico: file
+    temporaneo nella stessa cartella + rename. Da chiamare sotto `_lock`."""
+    percorso = cartella / CONTATTO
+    try:
+        prima_riga = percorso.read_text(encoding="utf-8").split("\n", 1)[0]
+        if prima_riga == f"email: {email}":
+            return
+    except (OSError, UnicodeDecodeError):
+        pass  # assente o illeggibile: si (ri)scrive
+    ora = datetime.now(FUSO).isoformat(timespec="seconds")
+    testo = f"email: {email}\ncodice: {codice}\nprodotto: {handle}\naggiornato: {ora}\n"
+    temporaneo = cartella / _CONTATTO_TMP
+    try:
+        with open(temporaneo, "w", encoding="utf-8", newline="\n") as f:
+            f.write(testo)
+        os.replace(temporaneo, percorso)
+    except BaseException:
+        temporaneo.unlink(missing_ok=True)
+        raise
+
+
 def salva_foto(
     data: bytes,
     filename: str | None,
     prodotto: str | None,
     sessione: str | None = None,
     chiave: str | None = None,
+    email: str | None = None,
 ) -> dict:
     """Salva i byte ORIGINALI (nessuna ricodifica), un file solo per foto: prodotto,
     mese, codice e numero stanno nel percorso, il nome originale nella risposta.
@@ -380,10 +443,14 @@ def salva_foto(
     aggiunge alla cartella della sessione sotto questo prodotto (anche se di un mese
     precedente) o, se non c'è, la crea nel mese corrente.
 
+    `email` è obbligatoria su ogni caricamento (EmailNonValida, prima di toccare il
+    disco): finisce in contatto.txt nella cartella del codice.
+
     Ritorna {"codice", "numero", "chiave", "nome", "byte"}; "chiave" è None se
     FOTO_SEGRETO manca. Solleva FotoError per input non validi.
     """
     handle = valida_prodotto(prodotto)
+    email = valida_email(email)
     if sessione:
         sessione = verifica_sessione(sessione, chiave)
     _formato, ext, _larghezza, _altezza = ispeziona_immagine(data)
@@ -414,6 +481,11 @@ def salva_foto(
                 f.close()
                 percorso_foto.unlink(missing_ok=True)  # solo quello creato qui
                 raise
+        try:
+            _scrivi_contatto(cartella, email, codice, handle)
+        except Exception:
+            percorso_foto.unlink(missing_ok=True)  # niente foto senza contatto
+            raise
 
     return {
         "codice": codice,

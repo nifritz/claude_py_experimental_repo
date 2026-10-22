@@ -20,6 +20,7 @@ ORIGINE_OK = "https://bimbiunici.it"
 CODICE_RE = re.compile(r"^F-\d{4}-[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{5}$")
 SEGRETO_TEST = "segreto-di-test-lungo-almeno-32-caratteri!"
 PRODOTTO = "ritratto-da-foto-in-rilievo"
+EMAIL = "mamma@example.com"
 GB = 1024**3
 DiskUsage = namedtuple("DiskUsage", "total used free")
 
@@ -57,8 +58,11 @@ def _post(
     prodotto=PRODOTTO,
     sessione=None,
     chiave=None,
+    email=EMAIL,
 ):
     form = {"prodotto": prodotto}
+    if email is not None:
+        form["email"] = email
     if sessione is not None:
         form["sessione"] = sessione
     if chiave is not None:
@@ -69,7 +73,7 @@ def _post(
 def _post_xff(client, data: bytes, xff: str):
     return client.post(
         "/foto",
-        data={"prodotto": PRODOTTO},
+        data={"prodotto": PRODOTTO, "email": EMAIL},
         files={"file": ("a.jpg", data, "image/jpeg")},
         headers={"X-Forwarded-For": xff},
     )
@@ -87,6 +91,10 @@ def _elimina(client, sessione, chiave, numero, prodotto=PRODOTTO):
 
 def _file_salvati(tmp_path):
     return sorted(p for p in tmp_path.rglob("*") if p.is_file())
+
+
+def _solo_foto(tmp_path):
+    return [p for p in _file_salvati(tmp_path) if p.name != "contatto.txt"]
 
 
 def _istantanea(tmp_path) -> dict:
@@ -114,7 +122,9 @@ def _sessione(client, n_foto=1, prodotto=PRODOTTO):
 
 
 def _numeri(cartella):
-    return sorted(int(p.name.split("_")[0]) for p in cartella.iterdir())
+    return sorted(
+        int(p.name.split("_")[0]) for p in cartella.iterdir() if p.name[0].isdigit()
+    )
 
 
 # 1) JPEG valido ------------------------------------------------------------ #
@@ -131,10 +141,14 @@ def test_jpeg_valido_salvato_con_byte_identici(client, tmp_path):
     assert body["nome"] == nome
     assert body["byte"] == len(data)
 
-    # un file solo, niente sidecar: prodotto, mese, codice e numero nel percorso
+    # una foto sola, niente sidecar (solo il contatto del cliente accanto):
+    # prodotto, mese, codice e numero nel percorso
     salvati = _file_salvati(tmp_path)
-    assert len(salvati) == 1
-    jpg = salvati[0]
+    assert [p.name for p in salvati if p.name != "contatto.txt"] == [
+        "1_La-mia-foto-e-bella.jpg"
+    ]
+    assert len(salvati) == 2
+    jpg = _solo_foto(tmp_path)[0]
     ora = foto_clienti.datetime.now(foto_clienti.FUSO)
     assert jpg.relative_to(tmp_path).parts == (
         "ritratto-di-coppia",
@@ -155,7 +169,7 @@ def test_file_esistente_mai_sovrascritto_ne_cancellato(tmp_path, monkeypatch):
     monkeypatch.setattr(foto_clienti, "genera_codice", lambda *_: "F-0101-AAAAA")
     monkeypatch.setattr(foto_clienti, "_prossimo_numero", lambda _c: 1)
     with pytest.raises(FileExistsError):
-        foto_clienti.salva_foto(_immagine("JPEG"), "foto.jpg", PRODOTTO)
+        foto_clienti.salva_foto(_immagine("JPEG"), "foto.jpg", PRODOTTO, email=EMAIL)
     assert altrui.read_bytes() == b"foto di un altro cliente"
 
 
@@ -213,7 +227,7 @@ def test_limite_esatto(client, tmp_path, monkeypatch):
     assert _post(client, data).status_code == 200
     monkeypatch.setattr(foto_clienti, "MAX_BYTES", len(data) - 1)
     assert _post(client, data).status_code == 413
-    assert len(_file_salvati(tmp_path)) == 1  # solo la foto del primo upload
+    assert len(_solo_foto(tmp_path)) == 1  # solo la foto del primo upload
 
 
 # 4) Contenuto non immagine --------------------------------------------------- #
@@ -477,7 +491,7 @@ def test_seconda_foto_stessa_cartella_numero_2(client, tmp_path):
         hashlib.sha256(seconda.read_bytes()).hexdigest()
         == hashlib.sha256(data).hexdigest()
     )
-    assert len(_file_salvati(tmp_path)) == 2  # tutte nella stessa cartella
+    assert len(_solo_foto(tmp_path)) == 2  # tutte nella stessa cartella
     assert {p.parent for p in _file_salvati(tmp_path)} == {cartella}
 
 
@@ -570,7 +584,7 @@ def test_sessione_di_altro_prodotto_crea_nel_prodotto_richiesto(client, tmp_path
         == 200
     )
     assert {p.name: p.read_bytes() for p in cartella_a.iterdir()} == prima_a
-    assert list(cartella_b.iterdir()) == []
+    assert [p.name for p in cartella_b.iterdir()] == ["contatto.txt"]
 
 
 def test_cancellazione_con_prodotto_sbagliato_404_non_tocca_nulla(client, tmp_path):
@@ -719,7 +733,10 @@ def test_cancellare_1_non_tocca_11(client):
     codice, chiave, cartella = _sessione(client)
     (cartella / "11_foto.jpg").write_bytes(b"undici")
     assert _elimina(client, codice, chiave, 1).status_code == 200
-    assert [p.name for p in cartella.iterdir()] == ["11_foto.jpg"]
+    assert sorted(p.name for p in cartella.iterdir()) == [
+        "11_foto.jpg",
+        "contatto.txt",
+    ]
 
 
 def test_symlink_verso_fuori_foto_dir_non_cancellato(client, tmp_path_factory):
@@ -739,7 +756,7 @@ def test_cartella_vuota_resta(client):
     codice, chiave, cartella = _sessione(client)
     assert _elimina(client, codice, chiave, 1).status_code == 200
     assert cartella.is_dir()
-    assert list(cartella.iterdir()) == []
+    assert [p.name for p in cartella.iterdir()] == ["contatto.txt"]
     # e la sessione continua a funzionare: n riparte da 1
     r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
     assert r.json()["numero"] == 1
@@ -815,3 +832,265 @@ def test_trentunesima_cancellazione_429(client):
     for _ in range(30):
         assert _elimina(client, codice, chiave, 9).status_code == 404
     assert _elimina(client, codice, chiave, 1).status_code == 429
+
+
+# 16) Email obbligatoria e contatto.txt ----------------------------------------- #
+def _contatto(cartella) -> str:
+    return (cartella / "contatto.txt").read_text(encoding="utf-8")
+
+
+def _righe_contatto(cartella) -> dict:
+    return dict(r.split(": ", 1) for r in _contatto(cartella).splitlines())
+
+
+def _orologio(monkeypatch, momento):
+    monkeypatch.setattr(
+        foto_clienti, "datetime", type("D", (), {"now": lambda _tz: momento})
+    )
+
+
+def test_email_mancante_400_nulla_su_disco(client, tmp_path):
+    r = _post(client, _immagine("JPEG"), email=None)
+    assert r.status_code == 400
+    assert r.json() == {"errore": "email"}
+    assert list(tmp_path.iterdir()) == []  # nemmeno la cartella del prodotto
+
+
+def test_email_mancante_su_aggiunta_400_nulla_cambia(client, tmp_path):
+    codice, chiave, _cartella = _sessione(client)
+    prima = _istantanea(tmp_path)
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave, email=None)
+    assert r.status_code == 400
+    assert r.json() == {"errore": "email"}
+    assert _istantanea(tmp_path) == prima
+
+
+EMAIL_NON_VALIDE = [
+    "",
+    "   ",
+    "senza-chiocciola.it",
+    "con spazio@example.com",
+    "mamma@exa mple.com",
+    "mamma@example.com\nBcc: x@y.it",
+    "mamma@example.com\r\nBcc: x@y.it",
+    "ma\tmma@example.com",
+    "ma\x00mma@example.com",
+    "a@@example.com",
+    "a@b@example.com",
+    "@example.com",
+    "mamma@",
+    "mamma@localhost",
+    "mamma@.com",
+    "mamma@example.",
+    "mamma@example..com",
+    "x" * 65 + "@example.com",
+    "a@" + "b" * 250 + ".it",
+]
+
+
+@pytest.mark.parametrize("email", EMAIL_NON_VALIDE)
+def test_email_non_valida_400_nulla_su_disco(client, tmp_path, email):
+    r = _post(client, _immagine("JPEG"), email=email)
+    assert r.status_code == 400
+    assert r.json() == {"errore": "email"}
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_email_lunga_254_ok_255_no(client):
+    dominio = ".".join(["d" * 50] * 3) + ".it"
+    ok = "a" * 64 + "@" + dominio
+    ok += "x" * (254 - len(ok))
+    assert len(ok) == 254
+    assert _post(client, _immagine("JPEG"), email=ok).status_code == 200
+    assert _post(client, _immagine("JPEG"), email=ok + "x").status_code == 400
+
+
+def test_email_parte_locale_64_ok(client):
+    r = _post(client, _immagine("JPEG"), email="a" * 64 + "@example.com")
+    assert r.status_code == 200
+
+
+def test_errore_email_porta_header_cors(client):
+    r = client.post(
+        "/foto",
+        data={"prodotto": PRODOTTO},
+        files={"file": ("a.jpg", _immagine("JPEG"), "image/jpeg")},
+        headers={"Origin": ORIGINE_OK},
+    )
+    assert r.status_code == 400
+    assert r.headers.get("access-control-allow-origin") == ORIGINE_OK
+
+
+def test_prima_foto_scrive_contatto_con_i_4_campi(client, tmp_path):
+    r = _post(client, _immagine("JPEG"), email=EMAIL)
+    assert r.status_code == 200
+    codice = r.json()["codice"]
+    cartella = foto_clienti.trova_cartella(tmp_path, PRODOTTO, codice)
+    righe = _righe_contatto(cartella)
+    assert list(righe) == ["email", "codice", "prodotto", "aggiornato"]
+    assert righe["email"] == EMAIL
+    assert righe["codice"] == codice
+    assert righe["prodotto"] == PRODOTTO
+    aggiornato = foto_clienti.datetime.fromisoformat(righe["aggiornato"])
+    assert aggiornato.utcoffset() is not None  # fuso esplicito (Europe/Rome)
+    assert _contatto(cartella).endswith("\n")
+    assert [p.name for p in cartella.iterdir() if p.name.startswith(".")] == []
+
+
+def test_email_normalizzata_strip_e_dominio_minuscolo(client, tmp_path):
+    r = _post(client, _immagine("JPEG"), email="  Mamma.Rossi@Example.COM ")
+    assert r.status_code == 200
+    cartella = foto_clienti.trova_cartella(tmp_path, PRODOTTO, r.json()["codice"])
+    # la parte locale resta com'è: è case-sensitive per standard
+    assert _righe_contatto(cartella)["email"] == "Mamma.Rossi@example.com"
+
+
+def test_seconda_foto_stessa_mail_contatto_invariato(client):
+    codice, chiave, cartella = _sessione(client)
+    prima = (cartella / "contatto.txt").read_bytes()
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave, email=EMAIL)
+    assert r.status_code == 200
+    assert (cartella / "contatto.txt").read_bytes() == prima
+
+
+def test_stessa_mail_con_dominio_maiuscolo_non_riscrive(client):
+    codice, chiave, cartella = _sessione(client)
+    prima = (cartella / "contatto.txt").read_bytes()
+    r = _post(
+        client,
+        _immagine("JPEG"),
+        sessione=codice,
+        chiave=chiave,
+        email=" mamma@EXAMPLE.com ",
+    )
+    assert r.status_code == 200
+    assert (cartella / "contatto.txt").read_bytes() == prima
+
+
+def test_seconda_foto_mail_diversa_aggiorna_contatto(client, monkeypatch):
+    vera = foto_clienti.datetime
+    _orologio(monkeypatch, vera(2026, 10, 22, 9, 0, tzinfo=foto_clienti.FUSO))
+    codice, chiave, cartella = _sessione(client)
+    prima = _righe_contatto(cartella)
+
+    _orologio(monkeypatch, vera(2026, 10, 22, 9, 30, tzinfo=foto_clienti.FUSO))
+    r = _post(
+        client,
+        _immagine("JPEG"),
+        sessione=codice,
+        chiave=chiave,
+        email="papa@example.org",
+    )
+    assert r.status_code == 200
+    dopo = _righe_contatto(cartella)
+    assert dopo["email"] == "papa@example.org"
+    assert (dopo["codice"], dopo["prodotto"]) == (prima["codice"], prima["prodotto"])
+    assert dopo["aggiornato"] != prima["aggiornato"]
+    assert dopo["aggiornato"].startswith("2026-10-22T09:30:00")
+    assert [p.name for p in cartella.iterdir() if p.name.startswith(".")] == []
+
+
+def test_aggiunta_con_cartella_nuova_scrive_contatto(client, tmp_path):
+    # sessione + chiave validi ma cartella inesistente: si apre ora, col suo contatto
+    codice = "F-1016-7K3QX"
+    chiave = foto_clienti.chiave_sessione(codice)
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.status_code == 200
+    cartella = foto_clienti.trova_cartella(tmp_path, PRODOTTO, codice)
+    assert _righe_contatto(cartella)["email"] == EMAIL
+
+
+def test_foto_rifiutata_non_tocca_il_contatto(client, tmp_path):
+    codice, chiave, _cartella = _sessione(client, n_foto=6)
+    prima = _istantanea(tmp_path)
+    r = _post(
+        client,
+        _immagine("JPEG"),
+        sessione=codice,
+        chiave=chiave,
+        email="altra@example.org",
+    )
+    assert r.status_code == 409
+    assert _istantanea(tmp_path) == prima  # nemmeno la mail cambia
+    r = _post(client, b"non una foto", sessione=codice, chiave=chiave, email="x@y.it")
+    assert r.status_code == 415
+    assert _istantanea(tmp_path) == prima
+
+
+def test_contatto_non_conta_nel_limite_delle_6_foto(client, tmp_path):
+    codice, chiave, cartella = _sessione(client, n_foto=6)
+    assert (cartella / "contatto.txt").is_file()
+    assert len(_solo_foto(tmp_path)) == 6
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.status_code == 409
+
+
+def test_sesta_foto_ok_con_contatto_presente(client):
+    codice, chiave, cartella = _sessione(client, n_foto=5)
+    assert (cartella / "contatto.txt").is_file()
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.status_code == 200
+    assert r.json()["numero"] == 6
+
+
+def test_numerazione_ignora_il_contatto(client):
+    codice, chiave, cartella = _sessione(client, n_foto=3)
+    assert _elimina(client, codice, chiave, 3).status_code == 200
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.json()["numero"] == 3
+    assert _numeri(cartella) == [1, 2, 3]
+    assert foto_clienti._prossimo_numero(cartella) == 4
+
+
+def test_cartella_con_solo_contatto_riparte_da_1(client):
+    codice, chiave, cartella = _sessione(client)
+    assert _elimina(client, codice, chiave, 1).status_code == 200
+    assert [p.name for p in cartella.iterdir()] == ["contatto.txt"]
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.json()["numero"] == 1
+
+
+def test_elimina_non_tocca_il_contatto(client):
+    codice, chiave, cartella = _sessione(client, n_foto=2)
+    contatto = (cartella / "contatto.txt").read_bytes()
+    assert _elimina(client, codice, chiave, 1).status_code == 200
+    assert _elimina(client, codice, chiave, 2).status_code == 200
+    assert (cartella / "contatto.txt").read_bytes() == contatto
+    assert _elimina(client, codice, chiave, 1).status_code == 404
+    assert (cartella / "contatto.txt").read_bytes() == contatto
+
+
+@pytest.mark.parametrize("numero", ["contatto.txt", "contatto", "0", "*", "1_*"])
+def test_elimina_non_accetta_il_nome_del_contatto(client, tmp_path, numero):
+    codice, chiave, _cartella = _sessione(client)
+    prima = _istantanea(tmp_path)
+    r = _elimina(client, codice, chiave, numero)
+    assert r.status_code in (400, 422)
+    assert _istantanea(tmp_path) == prima
+
+
+def test_nessun_endpoint_in_lettura_del_contatto(client):
+    rotte = {r.path for r in app.routes if "foto" in getattr(r, "path", "")}
+    assert rotte == {"/foto", "/foto/elimina"}
+    assert client.get("/foto/contatto.txt").status_code in (404, 405)
+
+
+def test_salva_foto_logica_richiede_email(tmp_path):
+    with pytest.raises(foto_clienti.EmailNonValida):
+        foto_clienti.salva_foto(_immagine("JPEG"), "a.jpg", PRODOTTO)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_contatto_scrittura_atomica_nessun_residuo(client):
+    codice, chiave, cartella = _sessione(client)
+    for i in range(3):
+        _post(
+            client,
+            _immagine("JPEG"),
+            sessione=codice,
+            chiave=chiave,
+            email=f"m{i}@example.com",
+        )
+    nomi = sorted(p.name for p in cartella.iterdir() if not p.name[0].isdigit())
+    assert nomi == ["contatto.txt"]
+    assert _righe_contatto(cartella)["email"] == "m2@example.com"
