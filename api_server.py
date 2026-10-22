@@ -30,7 +30,7 @@ import requests as http_requests
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image
 from pydantic import BaseModel
 
@@ -363,20 +363,23 @@ def _ip_foto(request: Request) -> str:
     )
 
 
-@app.post("/foto")
+@app.post("/foto", response_model=None)
 async def carica_foto(
     request: Request,
     file: UploadFile,
     prodotto: str = Form(...),
+    email: str | None = Form(None),
     sessione: str | None = Form(None),
     chiave: str | None = Form(None),
-) -> dict:
+) -> dict | JSONResponse:
     """
     Riceve la foto originale di un cliente (dal browser, pagina prodotto Shopify),
     la salva su disco senza ricodificarla e ritorna il codice del carrello.
 
     multipart/form-data: file, prodotto (handle Shopify = nome della cartella),
-    facoltativi sessione + chiave (codice e chiave ricevuti dal primo caricamento).
+    email (obbligatoria su ogni caricamento; mancante o non valida = 400
+    {"errore": "email"}, senza scrivere nulla), facoltativi sessione + chiave
+    (codice e chiave ricevuti dal primo caricamento).
     Senza sessione apre un codice nuovo (foto n. 1); con sessione aggiunge la foto
     successiva nella stessa cartella, massimo 6 (409 oltre).
     Risposta: {"codice": "F-0714-K7M2X", "numero": 1, "chiave": "<32 hex> | null",
@@ -390,6 +393,7 @@ async def carica_foto(
         if not foto_clienti.limiter.consenti(_ip_foto(request)):
             raise foto_clienti.TroppeRichieste("Troppe richieste, riprova più tardi")
         foto_clienti.valida_prodotto(prodotto)
+        email = foto_clienti.valida_email(email)
         if sessione:
             foto_clienti.verifica_sessione(sessione, chiave)
 
@@ -410,7 +414,10 @@ async def carica_foto(
             prodotto,
             sessione,
             chiave,
+            email,
         )
+    except foto_clienti.EmailNonValida:
+        return JSONResponse(status_code=400, content={"errore": "email"})
     except foto_clienti.FotoError as exc:
         status = _FOTO_STATUS[type(exc)]
         raise HTTPException(status_code=status, detail=exc.detail) from exc

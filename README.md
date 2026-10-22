@@ -197,6 +197,11 @@ serve mai file in lettura**: non esiste nessun `GET` che legga le foto salvate.
 **`POST /foto`** — `multipart/form-data`
 - `file` (obbligatorio) — la foto
 - `prodotto` (obbligatorio) — handle Shopify (`[a-z0-9-]`, max 80) = nome della cartella
+- `email` (obbligatorio su **ogni** caricamento, anche quelli con `sessione`) — si
+  normalizza (strip, dominio in minuscolo) e si controlla solo la forma: max 254
+  caratteri, una sola `@`, parte locale 1..64, dominio con almeno un punto, niente
+  spazi, a capo o caratteri di controllo. Mancante o non valida: **400
+  `{"errore": "email"}`** e niente scritto su disco.
 - `sessione`, `chiave` (facoltativi) — `codice` e `chiave` ricevuti dal primo caricamento
 - Senza `sessione`: nuovo codice, foto n. 1. Con `sessione` + `chiave`: foto
   successiva nella stessa cartella (anche se aperta il mese prima).
@@ -214,7 +219,7 @@ serve mai file in lettura**: non esiste nessun `GET` che legga le foto salvate.
 
 | Status | Quando |
 |---|---|
-| 400 | `prodotto`, `sessione` o `numero` non validi |
+| 400 | `prodotto`, `sessione` o `numero` non validi; `email` mancante/non valida (corpo `{"errore": "email"}`) |
 | 403 | `chiave` sbagliata per quella `sessione` |
 | 404 | (elimina) nessuna foto con quel numero per la sessione |
 | 409 | già 6 foto nella cartella |
@@ -233,6 +238,19 @@ più alto presente + 1; l'estensione deriva dal formato reale. Il codice è
 generato con `secrets` e rigenerato se già usato sotto **qualunque** prodotto e
 mese (cartella `<CODICE>` o vecchio file piatto `*_<CODICE>_*`). I vecchi file
 piatti `<AAAA-MM>/<AAAAMMGG-HHMM>_<CODICE>_<nome>.<ext>` restano dove sono.
+
+**Contatto.** Nella cartella del codice il server tiene `contatto.txt` (UTF-8):
+```
+email: <mail>
+codice: <CODICE>
+prodotto: <handle>
+aggiornato: <data e ora ISO, Europe/Rome>
+```
+Si scrive all'apertura del codice e si riscrive solo se un caricamento successivo
+porta una mail diversa (vale l'ultima); scrittura atomica (file temporaneo +
+rename). Non è una foto: non conta nel limite di 6, non entra nella numerazione e
+`/foto/elimina` (che accetta solo numeri) non lo può cancellare. Nessun endpoint lo
+legge: si consulta solo sul disco.
 
 **Chiave di sessione.** `chiave = HMAC-SHA256(FOTO_SEGRETO, codice)`, primi 32
 caratteri hex: stateless, confrontata con `hmac.compare_digest`. Variabile
