@@ -5,8 +5,10 @@ import hashlib
 import io
 import re
 from collections import namedtuple
+from datetime import datetime
 
 import pytest
+import requests
 from fastapi.testclient import TestClient
 from PIL import Image
 from pillow_heif import register_heif_opener
@@ -35,6 +37,9 @@ def _immagine(formato: str, size=(64, 48), **kw) -> bytes:
 def ambiente(tmp_path, monkeypatch):
     monkeypatch.setenv("FOTO_DIR", str(tmp_path))
     monkeypatch.setenv("FOTO_SEGRETO", SEGRETO_TEST)
+    # La notifica a n8n è off di default nei test (e nessun test esce in rete).
+    monkeypatch.delenv("N8N_FOTO_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("N8N_FOTO_SEGRETO", raising=False)
     # Spazio libero deterministico (il disco di sviluppo potrebbe essere sotto i 10 GB).
     monkeypatch.setattr(
         foto_clienti.shutil, "disk_usage", lambda _p: DiskUsage(10**12, 0, 10**12)
@@ -1094,3 +1099,170 @@ def test_contatto_scrittura_atomica_nessun_residuo(client):
     nomi = sorted(p.name for p in cartella.iterdir() if not p.name[0].isdigit())
     assert nomi == ["contatto.txt"]
     assert _righe_contatto(cartella)["email"] == "m2@example.com"
+
+
+# Notifica n8n all'apertura di un codice ------------------------------------ #
+
+WEBHOOK_URL = "http://n8n-finto:5678/webhook/bimbiunici-foto-caricate"
+SEGRETO_N8N = "segreto-n8n-di-test"
+
+
+class _Risposta:
+    def __init__(self, status_code=200):
+        self.status_code = status_code
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def n8n(monkeypatch):
+    """Webhook configurato + finto requests.post che registra le chiamate.
+    `n8n.esito` = status da restituire oppure eccezione da sollevare."""
+
+    class Finto:
+        def __init__(self):
+            self.chiamate = []
+            self.esito = 200
+            self.cartelle_viste = []
+
+        def post(self, url, **kw):
+            self.chiamate.append((url, kw))
+            self.cartelle_viste.append(
+                sorted(p.name for p in foto_clienti.get_foto_dir().rglob("*"))
+            )
+            if isinstance(self.esito, BaseException):
+                raise self.esito
+            return _Risposta(self.esito)
+
+    finto = Finto()
+    monkeypatch.setenv("N8N_FOTO_WEBHOOK_URL", WEBHOOK_URL)
+    monkeypatch.setenv("N8N_FOTO_SEGRETO", SEGRETO_N8N)
+    monkeypatch.setattr(foto_clienti.requests, "post", finto.post)
+    return finto
+
+
+def test_apertura_codice_notifica_una_volta_con_header_e_tre_campi(client, n8n):
+    r = _post(client, _immagine("JPEG"))
+    assert r.status_code == 200
+    assert len(n8n.chiamate) == 1
+    url, kw = n8n.chiamate[0]
+    assert url == WEBHOOK_URL
+    assert kw["headers"]["X-BU-Segreto"] == SEGRETO_N8N
+    assert kw["timeout"] == 3
+    body = kw["json"]
+    assert set(body) == {"codice", "prodotto", "ora"}
+    assert body["codice"] == r.json()["codice"]
+    assert body["prodotto"] == PRODOTTO
+    assert datetime.fromisoformat(body["ora"]).utcoffset() is not None
+
+
+def test_notifica_non_contiene_email_ne_nomi_file(client, n8n):
+    _post(
+        client, _immagine("JPEG"), nome="segretissimo.jpg", email="privata@example.com"
+    )
+    testo = repr(n8n.chiamate)
+    assert "privata@example.com" not in testo
+    assert "segretissimo" not in testo
+
+
+def test_notifica_parte_dopo_che_foto_e_contatto_sono_su_disco(client, n8n):
+    _post(client, _immagine("JPEG"))
+    visti = n8n.cartelle_viste[0]
+    assert "contatto.txt" in visti
+    assert any(n.startswith("1_") for n in visti)
+
+
+def test_seconda_foto_stesso_codice_nessuna_notifica(client, n8n):
+    codice, chiave, _ = _sessione(client)
+    assert len(n8n.chiamate) == 1
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.status_code == 200
+    assert len(n8n.chiamate) == 1
+
+
+def test_foto_1_ricaricata_dopo_cancellazione_non_riapre_il_codice(client, n8n):
+    codice, chiave, _ = _sessione(client)
+    assert _elimina(client, codice, chiave, 1).status_code == 200
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.json()["numero"] == 1
+    assert len(n8n.chiamate) == 1
+
+
+def test_elimina_non_notifica(client, n8n):
+    codice, chiave, _ = _sessione(client, n_foto=2)
+    n8n.chiamate.clear()
+    assert _elimina(client, codice, chiave, 2).status_code == 200
+    assert n8n.chiamate == []
+
+
+@pytest.mark.parametrize(
+    "mancante", ["N8N_FOTO_WEBHOOK_URL", "N8N_FOTO_SEGRETO", "tutte"]
+)
+def test_variabili_assenti_nessuna_chiamata_upload_200(
+    client, n8n, monkeypatch, mancante
+):
+    for nome in ("N8N_FOTO_WEBHOOK_URL", "N8N_FOTO_SEGRETO"):
+        if mancante in (nome, "tutte"):
+            monkeypatch.delenv(nome)
+    r = _post(client, _immagine("JPEG"))
+    assert r.status_code == 200
+    assert n8n.chiamate == []
+
+
+def _risposta_senza_notifica(client, tmp_path):
+    """Risposta di un upload quando n8n non è configurato (riferimento)."""
+    r = _post(client, _immagine("JPEG"), nome="a.jpg")
+    return r.status_code, sorted(r.json()), r.json()["numero"], r.json()["byte"]
+
+
+@pytest.mark.parametrize(
+    "esito",
+    [
+        RuntimeError("boom"),
+        requests.Timeout("lento"),
+        requests.ConnectionError("dns"),
+        500,
+        404,
+    ],
+    ids=["eccezione", "timeout", "rete-giu", "http-500", "http-404"],
+)
+def test_notifica_fallita_upload_identico(client, n8n, tmp_path, esito):
+    n8n.esito = esito
+    r = _post(client, _immagine("JPEG"), nome="a.jpg")
+    assert r.status_code == 200
+    assert sorted(r.json()) == ["byte", "chiave", "codice", "nome", "numero"]
+    assert (r.json()["numero"], r.json()["nome"]) == (1, "a.jpg")
+    assert len(n8n.chiamate) == 1
+    assert len(_solo_foto(tmp_path)) == 1
+    cartella = _solo_foto(tmp_path)[0].parent
+    assert _righe_contatto(cartella)["email"] == EMAIL
+
+
+def test_notifica_fallita_non_logga_il_segreto(client, n8n, caplog):
+    n8n.esito = RuntimeError(f"errore con {SEGRETO_N8N}")
+    with caplog.at_level("DEBUG"):
+        _post(client, _immagine("JPEG"))
+    assert "notifica" in caplog.text
+    assert SEGRETO_N8N not in caplog.text
+
+
+def test_richiesta_rifiutata_nessuna_notifica(client, n8n, tmp_path):
+    assert _post(client, _immagine("JPEG"), email=None).status_code == 400
+    assert _post(client, _immagine("JPEG"), email="non-una-mail").status_code == 400
+    assert _post(client, b"non e' una foto").status_code == 415
+    assert n8n.chiamate == []
+    assert _file_salvati(tmp_path) == []
+
+
+def test_settima_foto_409_nessuna_notifica_in_piu(client, n8n):
+    codice, chiave, _ = _sessione(client, n_foto=6)
+    assert len(n8n.chiamate) == 1
+    r = _post(client, _immagine("JPEG"), sessione=codice, chiave=chiave)
+    assert r.status_code == 409
+    assert len(n8n.chiamate) == 1
+
+
+def test_salva_foto_logica_invariata_senza_notifica(tmp_path):
+    out = foto_clienti.salva_foto(_immagine("JPEG"), "a.jpg", PRODOTTO, email=EMAIL)
+    assert sorted(out) == ["byte", "chiave", "codice", "nome", "numero"]

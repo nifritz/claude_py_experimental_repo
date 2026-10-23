@@ -27,7 +27,7 @@ import re
 from urllib.parse import unquote, urlparse
 
 import requests as http_requests
-from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -366,6 +366,7 @@ def _ip_foto(request: Request) -> str:
 @app.post("/foto", response_model=None)
 async def carica_foto(
     request: Request,
+    background_tasks: BackgroundTasks,
     file: UploadFile,
     prodotto: str = Form(...),
     email: str | None = Form(None),
@@ -388,6 +389,10 @@ async def carica_foto(
     Esposto su internet: rate limit, CORS ristretto, chiave HMAC per le sessioni,
     controllo del contenuto e dello spazio disco. NON esiste (e non va aggiunto)
     nessun GET che serva questi file.
+
+    All'apertura di un codice (cartella e contatto.txt appena creati) parte, DOPO la
+    risposta, una notifica a n8n (foto_clienti.notifica_apertura): se fallisce il
+    cliente non se ne accorge.
     """
     try:
         if not foto_clienti.limiter.consenti(_ip_foto(request)):
@@ -407,8 +412,8 @@ async def carica_foto(
         if not totale:
             raise foto_clienti.FormatoNonSupportato("File vuoto")
 
-        result = await run_in_threadpool(
-            foto_clienti.salva_foto,
+        result, aperto = await run_in_threadpool(
+            foto_clienti.salva_foto_aprendo,
             b"".join(blocchi),
             file.filename,
             prodotto,
@@ -427,6 +432,10 @@ async def carica_foto(
         result["numero"],
         totale,
     )
+    if aperto:
+        background_tasks.add_task(
+            foto_clienti.notifica_apertura, result["codice"], prodotto
+        )
     return result
 
 

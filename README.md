@@ -257,6 +257,16 @@ caratteri hex: stateless, confrontata con `hmac.compare_digest`. Variabile
 d'ambiente `FOTO_SEGRETO` (almeno 32 caratteri) da passare al container
 `python-utils`; cambiarla invalida le chiavi dei carrelli aperti.
 
+**Notifica a n8n (extra, facoltativa).** Quando un caricamento **apre** un codice
+(nasce la cartella con `contatto.txt`), dopo aver risposto al cliente parte un `POST`
+a un webhook n8n con header `X-BU-Segreto` e body `{"codice", "prodotto", "ora"}`
+(ISO Europe/Rome): niente email, nomi file, foto o URL. Non parte per la 2ª-6ª foto,
+per `/foto/elimina` né per richieste rifiutate. Se manca una delle due variabili
+non succede nulla; se fallisce (n8n giù, DNS, timeout di 3 s, 4xx/5xx) si registra una
+riga di warning senza segreto: risposta e file del cliente sono identici, nessun retry.
+- `N8N_FOTO_WEBHOOK_URL` — URL del webhook (sul VPS, rete docker interna)
+- `N8N_FOTO_SEGRETO` — valore dell'header `X-BU-Segreto`. Distinta da `FOTO_SEGRETO`.
+
 **Difese** (il servizio è esposto su internet):
 - **CORS** ristretto ai soli domini del negozio, metodi `POST`/`OPTIONS`, senza
   credenziali. Le chiamate server-to-server (senza `Origin`) non cambiano.
