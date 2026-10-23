@@ -30,6 +30,7 @@ import hashlib
 import hmac
 import io
 import ipaddress
+import logging
 import os
 import re
 import secrets
@@ -42,6 +43,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import requests
 from PIL import Image
 from pillow_heif import register_heif_opener
 
@@ -92,6 +94,13 @@ _PRODOTTO_RE = re.compile(
 )  # handle Shopify: niente punti né barre
 _NOME_MAX = 40
 _NOME_ORIGINALE_MAX = 255
+
+# Notifica a n8n all'apertura di un codice: un extra, mai un requisito del caricamento.
+N8N_TIMEOUT_S = 3
+_N8N_URL_ENV = "N8N_FOTO_WEBHOOK_URL"
+_N8N_SEGRETO_ENV = "N8N_FOTO_SEGRETO"  # diverso da FOTO_SEGRETO (HMAC delle sessioni)
+
+log = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 
@@ -436,6 +445,18 @@ def salva_foto(
     chiave: str | None = None,
     email: str | None = None,
 ) -> dict:
+    """Come `salva_foto_aprendo`, ma ritorna solo la risposta."""
+    return salva_foto_aprendo(data, filename, prodotto, sessione, chiave, email)[0]
+
+
+def salva_foto_aprendo(
+    data: bytes,
+    filename: str | None,
+    prodotto: str | None,
+    sessione: str | None = None,
+    chiave: str | None = None,
+    email: str | None = None,
+) -> tuple[dict, bool]:
     """Salva i byte ORIGINALI (nessuna ricodifica), un file solo per foto: prodotto,
     mese, codice e numero stanno nel percorso, il nome originale nella risposta.
 
@@ -446,8 +467,10 @@ def salva_foto(
     `email` è obbligatoria su ogni caricamento (EmailNonValida, prima di toccare il
     disco): finisce in contatto.txt nella cartella del codice.
 
-    Ritorna {"codice", "numero", "chiave", "nome", "byte"}; "chiave" è None se
-    FOTO_SEGRETO manca. Solleva FotoError per input non validi.
+    Ritorna (risposta, aperto): la risposta è {"codice", "numero", "chiave", "nome",
+    "byte"} ("chiave" è None se FOTO_SEGRETO manca); `aperto` è True solo se questo
+    caricamento ha creato la cartella del codice (e quindi contatto.txt).
+    Solleva FotoError per input non validi.
     """
     handle = valida_prodotto(prodotto)
     email = valida_email(email)
@@ -471,6 +494,7 @@ def salva_foto(
             cartella = cartella_mese / codice
         if not _dentro(cartella, radice):
             raise SessioneNonValida("Sessione non valida")
+        aperto = not cartella.exists()
         cartella.mkdir(parents=True, exist_ok=True)
         numero = _prossimo_numero(cartella)
         percorso_foto = cartella / f"{numero}_{nome_pulito}.{ext}"
@@ -487,13 +511,49 @@ def salva_foto(
             percorso_foto.unlink(missing_ok=True)  # niente foto senza contatto
             raise
 
-    return {
+    risposta = {
         "codice": codice,
         "numero": numero,
         "chiave": chiave_sessione(codice),
         "nome": nome_originale,
         "byte": len(data),
     }
+    return risposta, aperto
+
+
+def notifica_apertura(codice: str, prodotto: str) -> None:
+    """Avvisa n8n che si è aperto un codice nuovo. Da eseguire DOPO la risposta
+    (BackgroundTasks): non solleva mai e non ritenta.
+
+    Senza N8N_FOTO_WEBHOOK_URL e N8N_FOTO_SEGRETO non fa nulla. Il body ha solo
+    codice, prodotto e ora: niente email, nomi file o URL. Il segreto sta nell'header
+    X-BU-Segreto e non finisce mai nei log (si registra solo il tipo di errore).
+    """
+    try:
+        url = os.environ.get(_N8N_URL_ENV, "").strip()
+        segreto = os.environ.get(_N8N_SEGRETO_ENV, "")
+        if not url or not segreto:
+            log.debug("notifica n8n non configurata: salto")
+            return
+        risposta = requests.post(
+            url,
+            json={
+                "codice": codice,
+                "prodotto": prodotto,
+                "ora": datetime.now(FUSO).isoformat(timespec="seconds"),
+            },
+            headers={"X-BU-Segreto": segreto},
+            timeout=N8N_TIMEOUT_S,
+            allow_redirects=False,  # il segreto non deve seguire un redirect
+        )
+        stato = risposta.status_code
+        risposta.close()
+        if stato >= 400:
+            log.warning("notifica n8n rifiutata: codice=%s status=%d", codice, stato)
+    except Exception as exc:  # noqa: BLE001 - la notifica non deve mai far danno
+        log.warning(
+            "notifica n8n fallita: codice=%s errore=%s", codice, type(exc).__name__
+        )
 
 
 def elimina_foto(
